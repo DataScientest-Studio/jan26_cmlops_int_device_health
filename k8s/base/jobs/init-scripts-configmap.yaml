@@ -1,0 +1,53 @@
+# K1/K3 — Init helper scripts delivered via ConfigMap.
+# Mounted at /scripts in db-init and airflow-init Job pods.
+# Scripts are written at zero indentation so they are valid Python.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: init-scripts
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-device-health
+data:
+  wait_for_postgres.py: |
+    import socket, sys, time
+    print("Waiting for postgres:5432...")
+    for i in range(60):
+        try:
+            s = socket.create_connection(("postgres", 5432), timeout=3)
+            s.close()
+            print("postgres is ready")
+            sys.exit(0)
+        except OSError:
+            print(f"postgres not ready ({i}/60), waiting 5s")
+            time.sleep(5)
+    print("ERROR: Timed out waiting for postgres")
+    sys.exit(1)
+
+  create_airflow_db.py: |
+    import os, psycopg2
+    conn = psycopg2.connect(
+        host="postgres", port=5432,
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+    )
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM pg_database WHERE datname='airflow'")
+    if cur.fetchone():
+        print("airflow database already exists")
+    else:
+        cur.execute("CREATE DATABASE airflow")
+        print("Created airflow database")
+    conn.close()
+
+  db_init_k8s.py: |
+    import os
+    from src.database.database import Database
+    url = os.environ.get("DATABASE_URL", "")
+    if not url.startswith("postgresql"):
+        raise SystemExit("DATABASE_URL must point to PostgreSQL for K8s init job")
+    print("Initialising schema at " + url.split("@")[-1])
+    Database()
+    print("Schema initialised successfully")

@@ -1,0 +1,65 @@
+name: Test
+
+on:
+  push:
+    branches: [main, develop, 'feature/**']
+    paths-ignore:
+      - 'data/**/*.dvc'
+      - 'dvc.lock'
+      - 'doc/**'
+      - '*.md'
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+
+    env:
+      AIRFLOW__CORE__UNIT_TEST_MODE: "True"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+
+      - name: Ensure bootstrap model exists
+        run: |
+          if [ ! -f "models/bootstrap_model.pkl" ]; then
+            echo "⚠️  bootstrap_model.pkl missing — generating CI fallback..."
+            mkdir -p models
+            uv run python scripts/ci_generate_bootstrap_model.py
+          else
+            echo "✅ bootstrap_model.pkl found"
+          fi
+
+      - name: Run tests with pytest (fast suite — no Docker required)
+        run: |
+          # pyproject.toml addopts already injects --cov and --cov-report flags;
+          # only the marker filter is added here to avoid duplicated coverage flags.
+          uv run pytest tests/ -v -m "not live" --timeout=60
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false

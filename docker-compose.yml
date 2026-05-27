@@ -1,0 +1,500 @@
+services:
+  # PostgreSQL Database - Stores predictions, features, labels, MLflow & Airflow metadata
+  postgres:
+    image: postgres:15
+    container_name: mlops_postgres
+    command: postgres -c max_connections=300 -c shared_buffers=256MB
+    environment:
+      POSTGRES_DB: ${DB_NAME:-mlops_local}
+      POSTGRES_USER: ${DB_USER:-mlops_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.utf8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init_db.sql
+      - ./scripts/init_app_dbs.sh:/docker-entrypoint-initdb.d/02_init_app_dbs.sh
+      - ./scripts/pg_ensure_passwords.sh:/docker-entrypoint-initdb.d/10_ensure_passwords.sh
+      - ./scripts:/scripts
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - mlops_network
+    healthcheck:
+      # Two-step: first sync the password to match $DB_PASSWORD (only needs the
+      # Unix-socket trust connection that the postgres superuser always has),
+      # then confirm pg_isready.  This prevents password-drift between the
+      # volume (set on first-init) and .env.secrets (updated at any time).
+      test:
+        - "CMD-SHELL"
+        - >-
+          psql -U ${DB_USER:-mlops_user} -d ${DB_NAME:-mlops_local}
+          -c "ALTER USER ${DB_USER:-mlops_user} PASSWORD '${DB_PASSWORD:-changeme}';"
+          >/dev/null 2>&1;
+          pg_isready -U ${DB_USER:-mlops_user} -d ${DB_NAME:-mlops_local}
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # MLflow Tracking Server - Experiment tracking, model registry, artifact storage
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.9.0
+    container_name: mlops_mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+      --host 0.0.0.0
+      --port 5000
+      --allowed-hosts "*"
+    environment:
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+      - mlflow_db:/mlflow
+    ports:
+      - "${MLFLOW_PORT:-5001}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # FastAPI Inference Service - Handles /predict, /auth, /health, /ready endpoints
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: mlops_api
+    environment:
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-}
+      # Set MLFLOW_TRACKING_INSECURE_TLS=true in .env.windows.local when behind a
+      # corporate TLS-inspection proxy (self-signed cert in chain). Defaults false.
+      MLFLOW_TRACKING_INSECURE_TLS: ${MLFLOW_TRACKING_INSECURE_TLS:-false}
+      # Cap per-request timeout for MLflow HTTP calls (default 120 s is too long
+      # on corporate proxies). Override in .env.windows.local.
+      MLFLOW_HTTP_REQUEST_TIMEOUT: ${MLFLOW_HTTP_REQUEST_TIMEOUT:-120}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      DATABASE_URL: postgresql://${DB_USER:-mlops_user}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-mlops_local}
+      MODEL_REGISTRY_ENABLED: ${MODEL_REGISTRY_ENABLED:-true}
+      MODEL_REGISTRY_NAME: ${MODEL_REGISTRY_NAME:-device_health_classifier}
+      MODEL_REGISTRY_STAGE: ${MODEL_REGISTRY_STAGE:-Production}
+      # JWT signing key — must be set in .env.secrets
+      API_SECRET_KEY: ${API_SECRET_KEY:-}
+      # Seconds to wait for MLflow registry on startup before falling back
+      MODEL_REGISTRY_TIMEOUT: ${MODEL_REGISTRY_TIMEOUT:-60}
+      PYTHONUNBUFFERED: 1
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./reports:/app/reports  # drift summary JSONs: detect_drift.py (host) → API /metrics (container)
+    # Note: API is not directly exposed - access through Nginx on port 80/443
+    # Uncomment for direct API access in development:
+    # ports:
+    #   - "${API_PORT:-8000}:8000"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      # timeout: time curl has to get a response.  In cloud mode the first
+      # request calls get_model() which may take up to MODEL_REGISTRY_TIMEOUT
+      # seconds (default 60 s) if the model is not yet cached.  Set this
+      # higher than the default so curl does not time out before the API
+      # responds.  On subsequent calls the model is cached so response is fast.
+      timeout: 30s
+      retries: 5
+      # start_period: container is not marked unhealthy during this window.
+      # Cloud mode needs time to download the model from DagsHub.  Set to
+      # MODEL_REGISTRY_TIMEOUT + buffer.  Override via MODEL_REGISTRY_TIMEOUT.
+      start_period: 180s
+    restart: unless-stopped
+
+  # FastAPI Challenger Service - Second API for A/B testing, serves the Staging model
+  api_challenger:
+    profiles: ["ab_testing"]
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: mlops_api_challenger
+    environment:
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      DATABASE_URL: postgresql://${DB_USER:-mlops_user}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-mlops_local}
+      MODEL_REGISTRY_ENABLED: ${MODEL_REGISTRY_ENABLED:-true}
+      MODEL_REGISTRY_NAME: ${MODEL_REGISTRY_NAME:-device_health_classifier}
+      MODEL_REGISTRY_STAGE: Staging
+      PYTHONUNBUFFERED: 1
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+    ports:
+      - "${API_CHALLENGER_PORT:-8001}:8000"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # Airflow Webserver & Scheduler - Workflow orchestration
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/airflow_mlops.Dockerfile
+    container_name: mlops_airflow
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${DB_USER:-mlops_user}:${DB_PASSWORD:-changeme}@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-changeme_secret_key}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-changeme_fernet_key}
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      # Allow Airflow to be embedded in iframes (Streamlit embedded viewer)
+      AIRFLOW__WEBSERVER__X_FRAME_ENABLED: 'True'
+      AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: 'True'
+      # Disable SSL-strict CSRF so the iframe login form works without HTTPS
+      AIRFLOW__WEBSERVER__WTF_CSRF_SSL_STRICT: 'False'
+      AIRFLOW__WEBSERVER__COOKIE_SAMESITE: Lax
+      AIRFLOW__WEBSERVER__COOKIE_SECURE: 'False'
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_PASSWORD:-admin}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      DAGSHUB_USER: ${DAGSHUB_USER:-}
+      DAGSHUB_TOKEN: ${DAGSHUB_TOKEN:-}
+      DAGSHUB_REPO: ${DAGSHUB_REPO:-}
+      DATABASE_URL: postgresql://${DB_USER:-mlops_user}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-mlops_local}
+      # Make the project's src/ package importable inside DAG task callables.
+      # The volume ./src:/opt/airflow/src mounts src/ at /opt/airflow/src, so
+      # adding /opt/airflow to PYTHONPATH lets Python resolve "import src.xxx".
+      PYTHONPATH: /opt/airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./data:/opt/airflow/data
+      - ./logs/airflow:/opt/airflow/logs
+      - ./src:/opt/airflow/src
+      - ./requirements.txt:/opt/airflow/requirements.txt
+      # Share the host models/ directory so champion_model.pkl written by
+      # bootstrap / automated_retraining on the host is visible to Airflow.
+      - ./models:/opt/airflow/models
+      # DVC repository files — enables dvc pull/push from inside the container.
+      # Shares the host's DVC cache (.dvc/cache) to avoid re-downloading files.
+      - ./.dvc:/opt/airflow/.dvc
+      - ./dvc.yaml:/opt/airflow/dvc.yaml
+      - ./dvc.lock:/opt/airflow/dvc.lock
+      - ./params.yaml:/opt/airflow/params.yaml:ro
+      # Share reports/ with the API container so drift summary JSONs written here
+      # (/opt/airflow/reports/drift/*.json) are visible to the API's /metrics scanner.
+      - ./reports:/opt/airflow/reports
+    ports:
+      - "${AIRFLOW_PORT:-8081}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    command: >
+      bash -c "airflow db init &&
+               airflow users create --username ${AIRFLOW_USER:-admin} --password ${AIRFLOW_PASSWORD:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com || true &&
+               airflow webserver & airflow scheduler"
+
+  # Nginx Reverse Proxy - SSL/TLS termination, rate limiting, load balancing, security headers
+  nginx:
+    image: nginx:alpine
+    container_name: mlops_nginx
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    depends_on:
+      api:
+        condition: service_started
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/nginx-health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Prometheus - Metrics collection and monitoring
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: mlops_prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      api:
+        condition: service_started
+      alertmanager:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Alertmanager - Alert routing and notification management
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: mlops_alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=http://localhost:9093'
+    volumes:
+      - ./docker/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./docker/alertmanager/templates:/etc/alertmanager/templates:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "${ALERTMANAGER_PORT:-9093}:9093"
+    environment:
+      # Email configuration
+      ALERT_EMAIL_FROM: ${ALERT_EMAIL_FROM:-alertmanager@mlops.local}
+      ALERT_SMTP_HOST: ${ALERT_SMTP_HOST:-smtp.gmail.com:587}
+      ALERT_SMTP_USERNAME: ${ALERT_SMTP_USERNAME:-}
+      ALERT_SMTP_PASSWORD: ${ALERT_SMTP_PASSWORD:-}
+      # Team email addresses
+      ALERT_TEAM_EMAIL: ${ALERT_TEAM_EMAIL:-mlops-team@example.com}
+      ALERT_CRITICAL_EMAIL: ${ALERT_CRITICAL_EMAIL:-mlops-oncall@example.com}
+      ALERT_API_TEAM_EMAIL: ${ALERT_API_TEAM_EMAIL:-api-team@example.com}
+      ALERT_ML_TEAM_EMAIL: ${ALERT_ML_TEAM_EMAIL:-ml-team@example.com}
+      ALERT_DEVOPS_TEAM_EMAIL: ${ALERT_DEVOPS_TEAM_EMAIL:-devops-team@example.com}
+      # Slack webhook
+      ALERT_SLACK_WEBHOOK_URL: ${ALERT_SLACK_WEBHOOK_URL:-}
+      # Airflow credentials for webhooks
+      AIRFLOW_USERNAME: ${AIRFLOW_USER:-airflow}
+      AIRFLOW_PASSWORD: ${AIRFLOW_PASSWORD:-airflow}
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # Node Exporter - Host system metrics (CPU, memory, disk, network)
+  # Requires Linux host filesystem mounts (/proc, /sys, /).
+  # Works on native Linux AND macOS Docker Desktop (which uses a Linux VM).
+  # Only starts when --profile linux is passed; the Makefile does this
+  # automatically on Linux and macOS. Windows Docker Desktop is excluded.
+  node_exporter:
+    profiles: [linux]
+    image: prom/node-exporter:v1.7.0
+    container_name: mlops_node_exporter
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/host'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro,rslave
+    ports:
+      - "${NODE_EXPORTER_PORT:-9100}:9100"
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9100/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # cAdvisor - Container metrics (per-container CPU, memory, network, disk)
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: mlops_cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "${CADVISOR_PORT:-8082}:8080"
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # postgres_exporter - Exports PostgreSQL internal metrics (connections, query
+  # duration, cache hit ratio, lock waits, table sizes) to Prometheus.
+  # Runs alongside mlops_postgres and is available in both local and cloud mode.
+  # Metrics endpoint: http://mlops_postgres_exporter:9187/metrics
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: mlops_postgres_exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${DB_USER:-mlops_user}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-mlops_local}?sslmode=disable"
+    ports:
+      - "${POSTGRES_EXPORTER_PORT:-9187}:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9187/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Blackbox Exporter - HTTP/HTTPS endpoint probing for up/down alerts
+  # Probes Nginx and Airflow health endpoints; exposes probe_success metric.
+  # Used by NginxDown and AirflowDown alert rules in alerts.yml.
+  # Metrics endpoint: http://mlops_blackbox_exporter:9115/metrics
+  blackbox_exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: mlops_blackbox_exporter
+    command:
+      - '--config.file=/config/blackbox.yml'
+    volumes:
+      - ./docker/blackbox/blackbox.yml:/config/blackbox.yml:ro
+    ports:
+      - "${BLACKBOX_EXPORTER_PORT:-9115}:9115"
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9115/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Grafana - Dashboards and visualization
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: mlops_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: ''
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_SECURITY_ALLOW_EMBEDDING: 'true'
+      GF_SECURITY_X_FRAME_OPTIONS_HEADER: ''
+      # Allow session cookie to be sent inside iframes (SameSite=Lax allows
+      # same-origin iframe requests; Strict blocks them which causes login loops)
+      GF_SECURITY_COOKIE_SAMESITE: lax
+      GF_SECURITY_COOKIE_SECURE: 'false'
+    volumes:
+      # Named volume FIRST — provides persistent Grafana DB (grafana.db, plugins, etc.)
+      # Bind mounts below are applied AFTER and take precedence for their specific paths.
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
+      # Dashboards bind-mount must come AFTER the named volume so that the current
+      # JSON files on the host always override any cached copy in grafana_data.
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  mlflow_artifacts:
+    driver: local
+  mlflow_db:
+    driver: local
+  prometheus_data:
+    driver: local
+  alertmanager_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  mlops_network:
+    driver: bridge

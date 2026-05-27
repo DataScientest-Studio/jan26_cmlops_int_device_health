@@ -1,0 +1,257 @@
+# Alertmanager Configuration for MLOps Device Health Monitoring
+#
+# This configuration defines:
+# - Alert routing rules
+# - Notification receivers (email, Slack, webhook)
+# - Grouping and throttling policies
+# - Silence and inhibition rules
+
+global:
+  # Default SMTP settings for email notifications
+  smtp_from: 'alertmanager@mlops-device-health.local'
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_auth_username: ''
+  smtp_auth_password: ''
+  smtp_require_tls: false
+
+  # Slack API URL (optional - leave empty to disable)
+  slack_api_url: 'http://localhost'
+
+  # Resolve timeout - how long to wait before auto-resolving an alert
+  resolve_timeout: 5m
+
+# Templates for alert notifications
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+# Alert routing tree
+route:
+  # Default receiver for all alerts
+  receiver: 'team-notifications'
+
+  # Group alerts by these labels
+  group_by: ['alertname', 'severity', 'component']
+
+  # Wait time before sending first notification
+  group_wait: 30s
+
+  # Wait time before sending new alerts in same group
+  group_interval: 5m
+
+  # Wait time before re-sending resolved alerts
+  repeat_interval: 4h
+
+  # Child routes for specific alert types
+  routes:
+    # Suppress alerts labelled platform=windows (e.g. NodeExporterDown).
+    # On Windows Docker Desktop, node_exporter is intentionally absent.
+    # The NodeExporterDown alert carries platform: windows so Alertmanager
+    # can route it here instead of notifying the team.
+    - match:
+        platform: windows
+      receiver: 'null'
+      continue: false
+
+    # Critical alerts - immediate notification
+    - match:
+        severity: critical
+      receiver: 'critical-alerts'
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+      continue: true  # Also send to team-notifications
+
+    # API alerts - notify API team
+    - match:
+        component: api
+      receiver: 'api-team'
+      group_by: ['alertname', 'endpoint']
+      group_wait: 1m
+      continue: false
+
+    # Model alerts - notify ML team
+    - match:
+        component: model
+      receiver: 'ml-team'
+      group_by: ['alertname', 'model_version']
+      continue: false
+
+    # Drift detection - trigger automated retraining
+    - match:
+        component: drift
+      receiver: 'drift-webhook'
+      group_wait: 1m
+      group_interval: 30m
+      continue: true  # Also notify ML team
+
+    # Retraining failures - critical response needed
+    - match:
+        component: retraining
+      receiver: 'ml-team'
+      group_by: ['alertname']
+      continue: true
+
+    # System alerts - notify DevOps team
+    - match:
+        component: system
+      receiver: 'devops-team'
+      group_by: ['alertname', 'instance']
+      continue: false
+
+    # Info alerts - low priority, daily digest
+    - match:
+        severity: info
+      receiver: 'info-digest'
+      group_wait: 1h
+      group_interval: 24h
+      repeat_interval: 168h  # Weekly
+
+# Alert receivers - notification destinations
+receivers:
+  # Null / blackhole receiver — suppress selected alerts without notification.
+  # Used for: platform=windows alerts (e.g. NodeExporterDown on Windows Docker Desktop)
+  - name: 'null'
+
+  # Default receiver - sends to team email + Slack
+  - name: 'team-notifications'
+    email_configs:
+      - to: 'mlops-team@example.com'
+        headers:
+          Subject: '[MLOps Alert] {{ .GroupLabels.alertname }} - {{ .GroupLabels.severity }}'
+        html: '{{ template "email.html" . }}'
+        send_resolved: true
+
+    slack_configs:
+      - channel: '#mlops-alerts'
+        username: 'Prometheus Alertmanager'
+        icon_emoji: ':bell:'
+        title: '{{ .GroupLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.summary }}\n{{ end }}'
+        send_resolved: true
+
+  # Critical alerts - immediate escalation
+  - name: 'critical-alerts'
+    email_configs:
+      - to: 'mlops-oncall@example.com'
+        headers:
+          Subject: '🚨 CRITICAL: {{ .GroupLabels.alertname }}'
+          Priority: 'urgent'
+        html: '{{ template "email.html" . }}'
+        send_resolved: true
+
+    slack_configs:
+      - channel: '#mlops-critical'
+        username: 'Critical Alert'
+        icon_emoji: ':rotating_light:'
+        title: '🚨 CRITICAL: {{ .GroupLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}'
+        color: 'danger'
+        send_resolved: true
+
+  # API team receiver
+  - name: 'api-team'
+    email_configs:
+      - to: 'api-team@example.com'
+        headers:
+          Subject: '[API Alert] {{ .GroupLabels.alertname }}'
+        html: '{{ template "email.html" . }}'
+
+    slack_configs:
+      - channel: '#api-alerts'
+        username: 'API Monitor'
+        icon_emoji: ':desktop_computer:'
+        title: '{{ .GroupLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.summary }}\n{{ end }}'
+
+  # ML team receiver
+  - name: 'ml-team'
+    email_configs:
+      - to: 'ml-team@example.com'
+        headers:
+          Subject: '[ML Alert] {{ .GroupLabels.alertname }}'
+        html: '{{ template "email.html" . }}'
+
+    slack_configs:
+      - channel: '#ml-alerts'
+        username: 'ML Monitor'
+        icon_emoji: ':robot_face:'
+        title: '{{ .GroupLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.summary }}\n{{ end }}'
+
+  # DevOps team receiver
+  - name: 'devops-team'
+    email_configs:
+      - to: 'devops-team@example.com'
+        headers:
+          Subject: '[System Alert] {{ .GroupLabels.alertname }}'
+        html: '{{ template "email.html" . }}'
+
+    slack_configs:
+      - channel: '#devops-alerts'
+        username: 'System Monitor'
+        icon_emoji: ':gear:'
+        title: '{{ .GroupLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.summary }}\n{{ end }}'
+
+  # Drift detection webhook - triggers Airflow DAG
+  - name: 'drift-webhook'
+    webhook_configs:
+      - url: 'http://airflow:8081/api/v1/dags/drift_triggered_retraining/dagRuns'
+        send_resolved: false
+        http_config:
+          basic_auth:
+            username: 'admin'
+            password: 'admin'
+
+  # Info digest - low-priority alerts
+  - name: 'info-digest'
+    email_configs:
+      - to: 'mlops-team@example.com'
+        headers:
+          Subject: '[MLOps] Daily Info Digest'
+        html: '{{ template "email.html" . }}'
+        send_resolved: false
+
+# Inhibition rules - suppress alerts based on other active alerts
+#
+# NOTE: equal: [] (empty) is intentional.
+# This stack scrapes a single API process — all alerts share the same job/instance
+# labels. Using equal: ['instance'] would require both the source and target alert
+# to carry identical instance label values, which is unreliable when alerts come
+# from different scrape jobs.  With equal: [], inhibition fires whenever
+# source_match and target_match labels are satisfied, regardless of instance.
+inhibit_rules:
+  # If API is down, suppress all other API alerts
+  - source_match:
+      alertname: 'APIDown'
+    target_match:
+      component: 'api'
+    equal: []
+
+  # If critical error rate, suppress warning error rate
+  - source_match:
+      alertname: 'CriticalErrorRate'
+    target_match:
+      alertname: 'HighErrorRate'
+    equal: []
+
+  # If very high latency, suppress high latency
+  - source_match:
+      alertname: 'VeryHighLatency'
+    target_match:
+      alertname: 'HighLatency'
+    equal: []
+
+  # If critical memory, suppress warning memory
+  - source_match:
+      alertname: 'CriticalMemoryUsage'
+    target_match:
+      alertname: 'HighMemoryUsage'
+    equal: []
+
+  # If critical label coverage, suppress warning label coverage
+  - source_match:
+      alertname: 'CriticalLabelCoverage'
+    target_match:
+      alertname: 'LowLabelCoverage'
+    equal: []

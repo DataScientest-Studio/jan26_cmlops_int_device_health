@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Local overlay — uses Docker Desktop K8s context.
+# Images are built locally with: make k8s-build
+# Apply with: kubectl apply -k k8s/overlays/local
+
+resources:
+  - ../../base
+
+patches:
+  # Scale API to 1 replica for local dev
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+    target:
+      kind: Deployment
+      name: api
+
+  # No storageClassName patches needed: base PVCs omit storageClassName so
+  # Kubernetes uses the cluster default automatically.
+  #   OrbStack / macOS:          local-path  (rancher.io/local-path)
+  #   Docker Desktop / Windows:  hostpath
+  # This makes the overlay portable across both platforms.

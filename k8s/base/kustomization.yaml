@@ -1,0 +1,51 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mlops
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  # secret.yaml is git-ignored (contains real credentials) and must be applied
+  # separately:  kubectl apply -f k8s/base/secret.yaml
+  # K2 — shared data/models PVC (ReadWriteOnce, single-node Docker Desktop K8s)
+  - storage/shared-data-pvc.yaml
+  # K1/K3 — init helper Python scripts delivered as a ConfigMap
+  - jobs/init-scripts-configmap.yaml
+  # K1 — app DB schema init (runs before api / airflow reach Running state)
+  - jobs/db-init-job.yaml
+  # K3 — Airflow metadata DB init (migrate + admin user) with PostgreSQL backend
+  - airflow/dags-configmap.yaml
+  - airflow/init-job.yaml
+  # K5 — drift reference data copied to shared PVC on first deploy
+  - jobs/drift-init-job.yaml
+  - postgres/pvc.yaml
+  - postgres/deployment.yaml
+  - postgres/service.yaml
+  - mlflow/pvc.yaml
+  - mlflow/deployment.yaml
+  - mlflow/service.yaml
+  - api/deployment.yaml
+  - api/service.yaml
+  - api/hpa.yaml
+  - streamlit/deployment.yaml
+  - streamlit/service.yaml
+  - nginx/configmap.yaml
+  - nginx/deployment.yaml
+  - nginx/service.yaml
+  - airflow/pvc.yaml
+  - airflow/deployment.yaml
+  - airflow/service.yaml
+  - prometheus/pvc.yaml
+  - prometheus/rbac.yaml
+  - prometheus/configmap.yaml
+  - prometheus/deployment.yaml
+  - prometheus/service.yaml
+  - prometheus/kube-state-metrics-rbac.yaml
+  - prometheus/kube-state-metrics-deployment.yaml
+  - prometheus/kube-state-metrics-service.yaml
+  - grafana/pvc.yaml
+  - grafana/provisioning-configmap.yaml
+  - grafana/dashboard-configmap.yaml
+  - grafana/deployment.yaml
+  - grafana/service.yaml

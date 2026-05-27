@@ -1,0 +1,60 @@
+name: Code Quality
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "data/**"
+      - "doc/**"
+      - "*.md"
+  # schedule:
+  #   # Weekly Monday 06:00 UTC — disabled: repo is a project archive
+  #   - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  security-audit:
+    name: Security and Dependency Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install audit tools
+        run: pip install bandit pip-audit
+
+      # ── Python SAST (bandit) ────────────────────────────────────────────
+      # -ll: report only medium and high severity issues (skip low-noise low-severity)
+      # -f json: machine-readable output for artifact upload
+      # || true: existing findings don't block CI on first run; remove when codebase is clean
+      - name: Run bandit (Python SAST)
+        run: |
+          bandit -r src/ -ll -f json -o bandit-report.json || true
+          echo "=== Bandit Summary ==="
+          bandit -r src/ -ll || true
+
+      # ── Dependency CVE scan (pip-audit) ────────────────────────────────
+      # Scans requirements.txt against PyPI advisory database (OSV)
+      # || true: don't fail CI; treat as informational until triaged
+      - name: Run pip-audit (dependency CVE check)
+        run: |
+          pip-audit --requirement requirements.txt --format json --output pip-audit-report.json || true
+          echo "=== pip-audit Summary ==="
+          pip-audit --requirement requirements.txt || true
+
+      # ── Upload reports as workflow artifacts ───────────────────────────
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_id }}
+          path: |
+            bandit-report.json
+            pip-audit-report.json
+          retention-days: 30

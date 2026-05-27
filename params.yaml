@@ -1,0 +1,42 @@
+# parameters for DVC pipeline
+
+# Data Generation
+# shape_types and noise_range are captured implicitly:
+#   shape_types  → controlled by gaussian_fraction (1.0 = all Gaussian, 0.0 = all Lorentzian)
+#   noise_range  → set internally by drift_scenario in signal_generator.py
+generate_data:
+  n_samples: 100
+  gaussian_fraction: 0.7   # fraction of Gaussian (healthy) signals; rest are Lorentzian
+  mu_range: [40, 60]
+  sigma_range: [2.0, 5.0]
+  height_range: [1.5, 3.0]
+
+# Feature Extraction
+preprocess:
+  window_length: 11
+  polyorder: 3
+  peak_prominence: 0.5
+
+# Model Training
+train:
+  model_name: "device_health_classifier"
+  C: 1.0
+  penalty: "l2"
+  solver: "lbfgs"
+  max_iter: 1000
+  test_size: 0.2
+  random_state: 42
+
+# Model Evaluation
+evaluate:
+  metrics: ["accuracy", "precision", "recall", "f1_score"]
+  generate_confusion_matrix: true
+  generate_roc_curve: true
+
+# CI Model Quality Gate — thresholds used by .github/workflows/model-quality-gate.yml
+# These thresholds are conservative: the bootstrap model on clean synthetic data
+# should comfortably exceed both. If it doesn't, a regression in the training
+# pipeline has occurred.
+quality_gate:
+  min_accuracy: 0.80
+  min_f1: 0.75

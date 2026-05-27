@@ -1,0 +1,50 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# GHCR overlay — uses images from GitHub Container Registry.
+# Used by the deploy-k8s.yml CI/CD workflow and for pull-from-GHCR local testing.
+# Apply with: kubectl apply -k k8s/overlays/ghcr
+# Or:         make k8s-up K8S_OVERLAY=ghcr
+
+resources:
+  - ../../base
+
+# Override the three project-owned images with GHCR references.
+# Third-party images (postgres, nginx, grafana, prometheus, mlflow) are already
+# pulled from public registries and do not need to change.
+images:
+  - name: mlops-device-health/api
+    newName: ghcr.io/your-github-username/mlops-device-health-api
+    newTag: main
+  - name: mlops-device-health/streamlit
+    newName: ghcr.io/your-github-username/mlops-device-health-streamlit
+    newTag: main
+  - name: mlops-device-health/airflow
+    newName: ghcr.io/your-github-username/mlops-device-health-airflow
+    newTag: main
+
+# Change imagePullPolicy to Always so the cluster pulls the latest GHCR image
+# on every pod start (important for CI/CD: each push produces a new image with
+# the same "main" tag, so IfNotPresent would use a stale cached image).
+patches:
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+    target:
+      kind: Deployment
+      name: api
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+    target:
+      kind: Deployment
+      name: streamlit
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+    target:
+      kind: Deployment
+      name: airflow

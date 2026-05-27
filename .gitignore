@@ -1,0 +1,159 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# DVC
+.dvc/tmp
+.dvc/cache
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Data (tracked by DVC)
+/data/raw/*.csv
+/data/raw/*.json
+/data/processed/*.csv
+/data/processed/*.json
+!/data/**/.gitkeep
+
+# Models (tracked by DVC — except for the bootstrap model which is a committed artifact)
+/models/*.pkl
+/models/*.joblib
+/models/*.h5
+!/models/.gitkeep
+
+# Reports
+/reports/**/*.html
+/reports/**/*.json
+!/reports/**/.gitkeep
+
+# Environment Variables
+# .env            ← gitignored (legacy, may contain secrets)
+# .env.local      ← git-TRACKED (no secrets, local mode config) - DO NOT ADD HERE
+# .env.cloud      ← git-TRACKED (no secrets, cloud mode config) - DO NOT ADD HERE
+# .env.secrets    ← gitignored (secrets: passwords, tokens)
+# .env.secrets.example ← git-TRACKED (template for .env.secrets)
+# .env.*.local    ← gitignored (machine-specific overrides, e.g. .env.windows.local)
+.env
+.env.secrets
+.env.*.local
+# Runtime state file written by Makefile
+.current_mode
+
+# Kubernetes — real secrets (git-ignored, like .env.secrets)
+# k8s/base/secret.example.yaml ← git-TRACKED (template)
+# k8s/base/secret.yaml         ← gitignored (real credentials)
+k8s/base/secret.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# Logs
+*.log
+logs/
+
+# Docker
+*.dockerignore
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets
+secrets/
+*.pem
+*.key
+# SSL Certificates (local development self-signed certs)
+docker/nginx/ssl/
+docker/nginx/nginx.conf.bak*
+
+# Generated / runtime data (tracked by DVC or transient test artifacts)
+# data/raw/ and data/processed/ are handled above with *.csv patterns
+/data/bootstrap/
+# gold_standard CSV files are large — tracked by DVC.
+# The .dvc pointer files must NOT be git-ignored so they can be committed.
+/data/gold_standard/*.csv
+/data/samples/
+# Track the bundled example files (used for predictions testing / Streamlit upload demo)
+!/data/samples/healthy_signal.csv
+!/data/samples/unhealthy_signal.csv
+!/data/samples/healthy_signal.json
+!/data/samples/unhealthy_signal.json
+!/data/samples/batch_signals.csv
+!/data/samples/batch_signals.json
+/data/test_drift/
+/data/test_db/
+/data/raw_signals/
+/data/database/
+
+# Test and CI artifacts
+coverage.xml
+junit*.xml
+
+# Airflow runtime state (db is covered by *.db above, but be explicit)
+airflow/airflow.db
+airflow/standalone_admin_password.txt
+# Accidentally-nested source tree (created by running pip install -e . inside src/)
+src/src/

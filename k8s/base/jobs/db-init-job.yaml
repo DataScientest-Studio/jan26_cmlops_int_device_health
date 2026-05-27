@@ -1,0 +1,47 @@
+# K1 — Application database schema init Job
+# Waits for postgres, then ensures all app tables exist in PostgreSQL.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-device-health
+    app.kubernetes.io/component: db-init
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app: db-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: db-init
+          image: mlops-device-health/api:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - "python /scripts/wait_for_postgres.py && python /scripts/db_init_k8s.py"
+          envFrom:
+            - configMapRef:
+                name: mlops-config
+          env:
+            - name: PYTHONPATH
+              value: "/app"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: DB_PASSWORD
+            - name: DATABASE_URL
+              value: "postgresql://$(DB_USER):$(DB_PASSWORD)@postgres:5432/$(DB_NAME)"
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /scripts
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: init-scripts

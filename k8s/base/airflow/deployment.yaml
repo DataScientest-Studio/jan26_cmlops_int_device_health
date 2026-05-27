@@ -1,0 +1,148 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow
+  namespace: mlops
+  labels:
+    app: airflow
+    app.kubernetes.io/part-of: mlops-device-health
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow
+  template:
+    metadata:
+      labels:
+        app: airflow
+    spec:
+      containers:
+        - name: airflow
+          image: mlops-device-health/airflow:latest
+          imagePullPolicy: IfNotPresent
+          # K3: DB init handled by airflow-init Job (see airflow/init-job.yaml).
+          # Admin user creation is also in the init Job — kept here as fallback.
+          command:
+            - bash
+            - -c
+            - |
+              airflow users create \
+                --username "${AIRFLOW_USER}" \
+                --password "${AIRFLOW_PASSWORD}" \
+                --firstname Admin --lastname User \
+                --role Admin --email admin@example.com 2>/dev/null || true
+              airflow webserver &
+              airflow scheduler
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: mlops-config
+          env:
+            # DB_PASSWORD and DATABASE_URL must be declared BEFORE any env var
+            # that uses $(DB_PASSWORD) substitution (Kubernetes resolves in order).
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: DB_PASSWORD
+            - name: DATABASE_URL
+              value: "postgresql://$(DB_USER):$(DB_PASSWORD)@postgres:5432/$(DB_NAME)"
+            - name: AIRFLOW__CORE__EXECUTOR
+              value: "LocalExecutor"
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              value: "postgresql+psycopg2://$(DB_USER):$(DB_PASSWORD)@postgres:5432/airflow"
+            - name: AIRFLOW__API__AUTH_BACKENDS
+              value: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+            - name: AIRFLOW_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: mlops-config
+                  key: AIRFLOW_USER
+            - name: AIRFLOW_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: AIRFLOW_PASSWORD
+            - name: MLFLOW_TRACKING_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: MLFLOW_TRACKING_USERNAME
+            - name: MLFLOW_TRACKING_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: MLFLOW_TRACKING_PASSWORD
+          volumeMounts:
+            - name: airflow-logs
+              mountPath: /opt/airflow/logs
+            - name: airflow-models
+              mountPath: /opt/airflow/models
+            # Share MLflow artifact PVC so training tasks can write artifacts
+            # directly to the same storage backend that the MLflow server uses.
+            - name: mlflow-artifacts
+              mountPath: /mlflow/artifacts
+            # Mount each DAG file with subPath to avoid ConfigMap symlink recursive-loop
+            # (Airflow dags list fails when it follows ..data/ symlinks in whole-dir mounts)
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/_dag_guards.py
+              subPath: _dag_guards.py
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/automated_retraining.py
+              subPath: automated_retraining.py
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/batch_rescoring.py
+              subPath: batch_rescoring.py
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/database_backup.py
+              subPath: database_backup.py
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/drift_triggered_retraining.py
+              subPath: drift_triggered_retraining.py
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/evidently_drift_detection.py
+              subPath: evidently_drift_detection.py
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/model_promotion.py
+              subPath: model_promotion.py
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/sync_mlflow_to_dagshub.py
+              subPath: sync_mlflow_to_dagshub.py
+            - name: airflow-dags
+              mountPath: /opt/airflow/dags/sync_production_data.py
+              subPath: sync_production_data.py
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+      volumes:
+        - name: airflow-logs
+          persistentVolumeClaim:
+            claimName: airflow-logs-pvc
+        - name: airflow-models
+          persistentVolumeClaim:
+            claimName: airflow-models-pvc
+        - name: mlflow-artifacts
+          persistentVolumeClaim:
+            claimName: mlflow-artifacts-pvc
+        - name: airflow-dags
+          configMap:
+            name: airflow-dags

@@ -1,0 +1,23 @@
+# K2 — Shared data PVC
+# ReadWriteMany PVC so api, airflow, mlflow, and streamlit pods can all access
+# the same models/ and data/ directories.  Docker Desktop K8s uses the
+# "docker.io/hostpath" storage class which supports ReadWriteMany on a single node.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-data-pvc
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-device-health
+spec:
+  accessModes:
+    # Both local-path (OrbStack/macOS) and hostpath (Docker Desktop/Windows)
+    # only support ReadWriteOnce. On a single-node cluster all pods share the
+    # same node, so RWO PVCs are effectively accessible by all pods simultaneously.
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName intentionally omitted — uses the cluster default:
+  #   OrbStack / macOS:          local-path (rancher.io/local-path)
+  #   Docker Desktop / Windows:  hostpath

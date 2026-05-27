@@ -1,0 +1,38 @@
+# =============================================================================
+# Grafana Unified Alerting — MLOps Device Health
+# =============================================================================
+#
+# ARCHITECTURE DECISION: Prometheus is the SINGLE SOURCE OF TRUTH for alerting.
+# ALL alert rules are defined in docker/prometheus/alerts.yml.
+# Grafana is used exclusively for DISPLAY and DASHBOARDS.
+#
+# This file contains NO alert rule groups. All previously defined Grafana rules
+# have been removed:
+#   - drift-data-detected       → Prometheus: DriftDetected
+#   - drift-concept-detected    → Prometheus: DriftDetected
+#   - model-accuracy-drop       → Prometheus: ModelAccuracyDrop
+#   - prediction-distribution-skew → Prometheus: PredictionDistributionSkew
+#   - api-down                  → Prometheus: APIDown
+#   - drift-prediction-detected → Prometheus: PredictionDriftDetected (UC-20)
+#
+# The contact point below is preserved for future Grafana-native use cases
+# (e.g., dashboard-linked annotations) but is not used for alert routing.
+# =============================================================================
+
+apiVersion: 1
+
+# ---------------------------------------------------------------------------
+# Contact point — preserved for future use.
+# All production alerting routes through Prometheus → Alertmanager.
+# ---------------------------------------------------------------------------
+contactPoints:
+  - orgId: 1
+    name: MLOps Team
+    receivers:
+      - uid: mlops-team-receiver
+        type: prometheus-alertmanager
+        settings:
+          url: http://alertmanager:9093
+        disableResolveMessage: false
+
+# No alert rule groups — Prometheus handles all alerting.

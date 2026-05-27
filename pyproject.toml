@@ -1,0 +1,239 @@
+[project]
+name = "mlops-device-health"
+version = "0.1.0"
+description = "End-to-End MLOps for Device Health Prediction"
+authors = [{name = "Fred Richter"}]
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+dependencies = [
+    "alembic>=1.18.3",
+    "apache-airflow>=2.8.0,<2.11.0",
+    "bcrypt>=4.0.0,<5.0.0",
+    "dagshub>=0.6.5",
+    "dvc>=3.66.1",
+    "dvc-s3>=3.3.0",
+    "evidently>=0.4.0,<0.5.0",
+    "fastapi>=0.128.5",
+    "kubernetes>=27.2.0",
+    "loguru>=0.7.3",
+    "matplotlib>=3.10.8",
+    "mlflow>=3.9.0",
+    "numpy>=2.4.2",
+    "pandas>=2.3.3",
+    "pandera>=0.19",
+    "passlib[bcrypt]>=1.7.4",
+    "prometheus-client>=0.24.1",
+    "psycopg2-binary>=2.9.11",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.12.0",
+    "python-dotenv>=1.2.1",
+    "python-jose[cryptography]>=3.3.0",
+    "python-json-logger>=2.0.7",
+    "python-multipart>=0.0.22",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.0",
+    "sqlalchemy>=1.4.54,<2.0",
+    "streamlit-autorefresh>=1.0.1",
+    "structlog>=25.5.0",
+    "typer>=0.21.1",
+    "uvicorn[standard]>=0.40.0",
+]
+
+[dependency-groups]
+dev = [
+    "faker>=40.4.0",
+    "httpx>=0.28.1",
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "mypy>=1.19.1",
+    "nbformat>=5.10.4",
+    "pandas-stubs>=3.0.0.260204",
+    "plotly>=5.24.1",
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "pytest-mock>=3.15.1",
+    "pytest-sugar>=1.1.1",
+    "pytest-timeout>=2.3.1",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.15.0",
+    "seaborn>=0.13.2",
+    "streamlit>=1.54.0",
+    "types-pyyaml>=6.0.12",
+    "types-requests>=2.32.4.20260107",
+    "watchdog>=6.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+    "B008",  # FastAPI uses Depends() in function defaults (standard pattern)
+    "UP017", # datetime.UTC alias — project must support Python 3.8 (Airflow container)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# signal_models.py uses typing.List/Tuple for Python 3.8 compat (Pydantic v2 eval inside Airflow)
+"src/signal_processing/signal_models.py" = ["UP006", "UP035"]
+# ML/scientific code uses uppercase X as feature matrix (sklearn convention)
+"src/training/semi_supervised.py" = ["N806", "N803", "SIM102"]
+"src/training/train.py" = ["N806", "N803", "E402"]
+"tests/unit/test_semi_supervised.py" = ["N806", "N803"]
+"tests/unit/test_semi_supervised_heuristics.py" = ["N806", "N803"]
+"tests/integration/test_demonstration_scripts.py" = ["N806", "N803"]
+"tests/unit/test_mlflow_integration.py" = ["N806", "N803"]
+"tests/ml/*.py" = ["N806", "N803"]
+# Streamlit UI code requires deferred imports after sys.path manipulation
+"src/ui/*.py" = ["E402"]
+"src/ui/views/*.py" = ["E402", "N806"]
+"src/ui/views/use_cases_pkg/*.py" = ["N806"]
+# Integration/live tests do sys.path manipulation before imports
+"tests/integration/test_airflow_live.py" = ["E402"]
+"tests/integration/test_live_docker_stack.py" = ["E402", "N802"]
+# Scripts: ML convention uppercase (X, X_train) and deferred sys.path imports
+"scripts/demo_semi_supervised_training.py" = ["N806", "N803"]
+"scripts/demo_sharding.py" = ["E402"]
+"scripts/*.py" = ["N806", "N803", "E402"]
+"airflow/dags/*.py" = ["N806"]
+"tests/unit/test_uc05_challenger_script.py" = ["N806", "N803"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+# Relaxed from strict mode — gradual adoption; annotation-only issues suppressed.
+# Real semantic bugs are fixed with inline # type: ignore[<code>] on the offending line.
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+plugins = ["pydantic.mypy"]
+exclude = [
+    "venv/",
+    ".venv/",
+    "build/",
+    "dist/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "scipy.*",
+    "sklearn.*",
+    "mlflow.*",
+    "evidently.*",
+    "streamlit.*",
+]
+ignore_missing_imports = true
+
+# Third-party packages without type stubs or py.typed markers
+[[tool.mypy.overrides]]
+module = [
+    "psycopg2",
+    "psycopg2.*",
+    "jose",
+    "jose.*",
+    "passlib",
+    "passlib.*",
+    "plotly",
+    "plotly.*",
+    "locust",
+    "locust.*",
+]
+ignore_missing_imports = true
+
+# Files with extensive ML-specific type patterns that mypy can't handle cleanly
+# (e.g. dynamic cluster labels, sklearn API's, Lorentzian vs Gaussian branching).
+# These modules are covered by unit tests instead of mypy static analysis.
+[[tool.mypy.overrides]]
+module = [
+    "src.training.semi_supervised",
+    "src.signal_processing.signal_generator",
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+python_classes = "Test*"
+addopts = [
+    "-v",
+    "--cov=src",
+    "--cov-report=html",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
+    "--strict-markers",
+    "-m", "not live and not ui",
+]
+timeout = 60
+asyncio_mode = "auto"
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "slow: Slow tests",
+    "live: Tests that require a running Docker stack (auto-started if not running)",
+    "cloud: Tests that require cloud credentials (DagsHub/S3) and network access",
+    "ui: Streamlit UI tests (run with: make test-ui)",
+    "postgres: Tests that require a real PostgreSQL instance (set POSTGRES_TEST_URL)",
+    "bootstrap: K8s greenfield bootstrap tests — create/promote a new model version; safe on existing clusters but excluded from default runs to avoid changing the champion unexpectedly",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/venv/*",
+    "*/__pycache__/*",
+    "*/site-packages/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "def __str__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+precision = 2
+show_missing = true
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+    "mlops_device_health",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,55 @@
+# K5 — Drift reference data init Job
+# Copies data/drift/reference_data.parquet from the container image to the
+# shared-data-pvc so that drift detection DAGs and the monitoring API can
+# read consistent baseline data from the shared volume.
+#
+# The api image includes the data/ directory (COPY data/ ./data/ in Dockerfile).
+# This Job runs once; subsequent runs are no-ops (file already present).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: drift-init
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-device-health
+    app.kubernetes.io/component: drift-init
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: drift-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: drift-init
+          image: mlops-device-health/api:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -c
+            - |
+              import shutil
+              from pathlib import Path
+
+              src = Path("/app/data/drift")
+              dst = Path("/data/drift")
+              dst.mkdir(parents=True, exist_ok=True)
+
+              for f in src.glob("*.parquet"):
+                  target = dst / f.name
+                  if not target.exists():
+                      shutil.copy2(f, target)
+                      print(f"Copied {f.name} -> {target}")
+                  else:
+                      print(f"Skipped {f.name} (already exists)")
+
+              print("Drift reference data init complete")
+          volumeMounts:
+            - name: shared-data
+              mountPath: /data
+      volumes:
+        - name: shared-data
+          persistentVolumeClaim:
+            claimName: shared-data-pvc

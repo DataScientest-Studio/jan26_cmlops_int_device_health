@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: mlops
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      - job_name: 'api'
+        static_configs:
+          - targets: ['api:8000']
+        metrics_path: /metrics
+
+      # NOTE: Airflow does not expose a native Prometheus /metrics endpoint on
+      # port 8080. A StatsD-exporter sidecar would be needed to bridge Airflow
+      # StatsD metrics → Prometheus format. Removed to prevent the "DOWN" entry
+      # in Prometheus scrape targets. Re-add when statsd-exporter is deployed.
+      # - job_name: 'airflow'
+      #   static_configs:
+      #     - targets: ['airflow:8080']
+      #   metrics_path: /metrics
+
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # ── Kubernetes-native metrics ─────────────────────────────────────────
+      # kube-state-metrics: Pod status, deployment replicas, HPA state, etc.
+      - job_name: 'kube-state-metrics'
+        static_configs:
+          - targets: ['kube-state-metrics:8080']
+        metrics_path: /metrics
+        scrape_interval: 30s
+
+      # Kubernetes API server metrics (health, request rates, latency)
+      - job_name: 'kubernetes-apiservers'
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names: ['default']
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: kubernetes;https
+
+      # Kubelet / cAdvisor: container CPU, memory, filesystem, network I/O
+      - job_name: 'kubernetes-nodes-cadvisor'
+        kubernetes_sd_configs:
+          - role: node
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        metrics_path: /metrics/cadvisor
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)

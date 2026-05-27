@@ -1,0 +1,10 @@
+[core]
+    analytics = false
+    remote = dagshub
+    check_update = false
+['remote "dagshub"']
+    url = https://dagshub.com/<YOUR_DAGSHUB_USERNAME>/<YOUR_DAGSHUB_REPO>.dvc
+    auth = basic
+    user = <YOUR_DAGSHUB_USERNAME>
+['remote "local"']
+    url = /tmp/dvc-local-remote

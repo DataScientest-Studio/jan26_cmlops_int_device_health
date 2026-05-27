@@ -1,0 +1,87 @@
+# =============================================================================
+# docker-compose.ghcr.yml — GHCR IMAGE OVERRIDE
+# =============================================================================
+# Used with:  make ghcr  /  make ghcr-rebuild
+# Command:    docker compose --env-file .env.cloud --env-file .env.secrets \
+#               -f docker-compose.yml -f docker-compose.cloud.yml \
+#               -f docker-compose.ghcr.yml pull
+#             docker compose ... up -d --force-recreate
+#
+# This overlay replaces the locally-built custom images (api, airflow) with
+# pre-built images pulled from GitHub Container Registry (ghcr.io), and adds
+# the Streamlit dashboard as a containerised service.  All public images
+# (postgres, nginx, prometheus, grafana, etc.) are unchanged from the base
+# docker-compose.yml + docker-compose.cloud.yml layers.
+#
+# Configurable variables (set in .env.secrets or pass on the command line):
+#
+#   GITHUB_OWNER   Owner/org name for the GHCR packages.
+#                  Default: your-github-username
+#                  Example: GITHUB_OWNER=myorg make ghcr
+#
+#   GHCR_TAG       Image tag to pull.  On main it is "main"; on a feature
+#                  branch the CI workflow creates a sanitised branch tag,
+#                  e.g. "feature-mlops-cross-platform".
+#                  Default: main
+#                  Example: GHCR_TAG=feature-mlops-cross-platform make ghcr
+#
+# Images published by the build.yml CI workflow on every push:
+#   ghcr.io/<GITHUB_OWNER>/mlops-device-health-api:<GHCR_TAG>
+#   ghcr.io/<GITHUB_OWNER>/mlops-device-health-airflow:<GHCR_TAG>
+#   ghcr.io/<GITHUB_OWNER>/mlops-device-health-streamlit:<GHCR_TAG>
+#
+# Prerequisites (same as cloud mode):
+#   - DAGSHUB_USER, DAGSHUB_TOKEN, DAGSHUB_REPO set in .env.secrets
+#   - GITHUB_TOKEN with read:packages scope in .env.secrets (for private packages)
+# =============================================================================
+
+services:
+
+  # ── API — pre-built GHCR image ────────────────────────────────────────────
+  api:
+    image: ghcr.io/${GITHUB_OWNER:-your-github-username}/mlops-device-health-api:${GHCR_TAG:-main}
+    build: null   # disable local build; image is pulled from GHCR
+
+  # ── API Challenger (A/B testing) — same GHCR image ────────────────────
+  api_challenger:
+    image: ghcr.io/${GITHUB_OWNER:-your-github-username}/mlops-device-health-api:${GHCR_TAG:-main}
+    build: null
+
+  # ── Airflow — pre-built GHCR image ───────────────────────────
+  airflow:
+    image: ghcr.io/${GITHUB_OWNER:-your-github-username}/mlops-device-health-airflow:${GHCR_TAG:-main}
+    build: null
+
+  # ── Streamlit Dashboard — GHCR-only containerised service ─────────────────
+  # Not started in local or cloud-build modes; only active in GHCR mode.
+  streamlit:
+    image: ghcr.io/${GITHUB_OWNER:-your-github-username}/mlops-device-health-streamlit:${GHCR_TAG:-main}
+    container_name: mlops_streamlit
+    environment:
+      # MLflow: use the cloud-mode buffer (same as API)
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow_buffer:5000}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-}
+      # Internal API URL (Docker network)
+      API_URL: http://api:8000
+      PYTHONUNBUFFERED: "1"
+      # Log file path inside the container (maps to host via volume below)
+      UI_LOG_FILE: /app/logs/ui_app.log
+    volumes:
+      # Expose the Streamlit UI log to the host so it can be tailed or
+      # read by the App Console page (if Streamlit is run from host).
+      - ./logs:/app/logs
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped

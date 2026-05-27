@@ -1,0 +1,91 @@
+# =============================================================================
+# docker-compose.local.yml — LOCAL MODE OVERLAY
+# =============================================================================
+# Used with:  make local
+# Command:    docker compose --env-file .env.local --env-file .env.secrets \
+#               -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# This overlay configures local mode settings.
+# Services: api, nginx, prometheus, grafana, postgres, mlflow.
+# Airflow is NOT started in local mode — training is done via
+# scripts/local_train.py and prediction via the API.
+#
+# NOTE: The Streamlit dashboard is run *locally* (make ui / streamlit run)
+# during development — NOT as a Docker container — to avoid port conflicts
+# with the local Streamlit process.  docker/streamlit.Dockerfile exists for
+# future production/demo deployment scenarios.
+# =============================================================================
+
+services:
+  # Local MLflow Tracking Server
+  # Runs entirely in Docker; artifacts stored in a named volume.
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.9.0
+    container_name: mlops_mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root mlflow-artifacts:/
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+      --host 0.0.0.0
+      --port 5000
+      --allowed-hosts "*"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+      - mlflow_db:/mlflow
+    ports:
+      - "${MLFLOW_PORT:-5001}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # In local mode, API depends on the local MLflow container being healthy
+  api:
+    environment:
+      DEPLOYMENT_MODE: local
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_TRACKING_USERNAME: ""
+      MLFLOW_TRACKING_PASSWORD: ""
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # Challenger API for A/B testing — same local overrides as the primary API.
+  api_challenger:
+    environment:
+      DEPLOYMENT_MODE: local
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_TRACKING_USERNAME: ""
+      MLFLOW_TRACKING_PASSWORD: ""
+
+  # Airflow is NOT started in local mode.
+  # scale: 0 prevents the container from being created.
+  airflow:
+    scale: 0
+
+  # node_exporter is excluded in local mode — --profile linux is never passed for
+  # local targets (see Makefile). No override needed.
+
+volumes:
+  mlflow_artifacts:
+    driver: local
+  mlflow_db:
+    driver: local

@@ -1,0 +1,73 @@
+# K3 — Airflow metadata DB init Job
+# Creates the airflow PostgreSQL database, runs airflow db migrate, and
+# creates the admin user.  The Airflow container image already contains all
+# DAGs at /app/airflow/dags — no separate DAGs volume needed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: airflow-init
+  namespace: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-device-health
+    app.kubernetes.io/component: airflow-init
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app: airflow-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: airflow-init
+          image: mlops-device-health/airflow:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - >-
+              python /scripts/wait_for_postgres.py &&
+              python /scripts/create_airflow_db.py &&
+              airflow db migrate &&
+              airflow users create
+              --username "${AIRFLOW_USER}"
+              --password "${AIRFLOW_PASSWORD}"
+              --firstname Admin --lastname User
+              --role Admin --email admin@example.com || true
+          envFrom:
+            - configMapRef:
+                name: mlops-config
+          env:
+            # DB_PASSWORD must be first so $(DB_PASSWORD) substitution works in
+            # AIRFLOW__DATABASE__SQL_ALCHEMY_CONN (Kubernetes resolves in order).
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: DB_PASSWORD
+            - name: AIRFLOW_HOME
+              value: "/opt/airflow"
+            - name: AIRFLOW__CORE__DAGS_FOLDER
+              value: "/opt/airflow/dags"
+            - name: AIRFLOW__CORE__EXECUTOR
+              value: "LocalExecutor"
+            - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+              value: "postgresql+psycopg2://$(DB_USER):$(DB_PASSWORD)@postgres:5432/airflow"
+            - name: AIRFLOW_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: mlops-config
+                  key: AIRFLOW_USER
+            - name: AIRFLOW_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mlops-secrets
+                  key: AIRFLOW_PASSWORD
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /scripts
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: init-scripts

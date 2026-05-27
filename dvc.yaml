@@ -1,0 +1,110 @@
+# DVC Pipeline Configuration
+# Run with: dvc repro
+#
+# Pipeline stages:
+#   generate_data          → create synthetic JSON datasets in data/raw/
+#   extract_features       → extract 6 features per signal, write data/processed/*.csv
+#   train                  → train semi-supervised classifier from raw JSON, output models/champion_model.pkl
+#   evaluate               → evaluate champion model on test CSVs, write metrics/eval_metrics.json
+#   sync_production_data   → (optional) export production DB to DVC-tracked data/sync/
+#
+# Why extract_features is a separate stage (not just inside train.py):
+#   - DVC can cache the expensive extraction between training runs
+#   - Feature CSVs can be inspected / visualised independently
+#   - evaluate stage re-uses the same test CSVs without re-running signal processing
+#
+# Why evaluate is a separate stage:
+#   - Re-evaluate on new test data without retraining
+#   - Champion/Challenger comparison by running evaluate against two model files
+#   - DVC tracks eval metrics independently of training metrics
+
+stages:
+  generate_data:
+    cmd: >-
+      python scripts/generate_data.py generate
+      --n-samples ${generate_data.n_samples}
+      --gaussian-fraction ${generate_data.gaussian_fraction}
+      --output-dir data/raw
+    deps:
+      - scripts/generate_data.py
+      - src/signal_processing/signal_generator.py
+      - src/signal_processing/signal_models.py
+    outs:
+      - data/raw/dataset_baseline_full.json
+      - data/raw/dataset_baseline_train.json
+      - data/raw/dataset_baseline_test.json
+    params:
+      - generate_data.n_samples
+      - generate_data.gaussian_fraction
+
+  extract_features:
+    cmd: >-
+      python -m src.signal_processing.preprocess
+      --train-data data/raw/dataset_baseline_train.json
+      --test-data  data/raw/dataset_baseline_test.json
+      --output-dir data/processed
+      --window-length ${preprocess.window_length}
+      --polyorder ${preprocess.polyorder}
+    deps:
+      - data/raw/dataset_baseline_train.json
+      - data/raw/dataset_baseline_test.json
+      - src/signal_processing/preprocess.py
+      - src/signal_processing/feature_extractor.py
+    outs:
+      - data/processed/features_train.csv
+      - data/processed/labels_train.csv
+      - data/processed/features_test.csv
+      - data/processed/labels_test.csv
+    params:
+      - preprocess.window_length
+      - preprocess.polyorder
+
+  train:
+    cmd: >-
+      python -m src.training.train
+      --train-data data/raw/dataset_baseline_train.json
+      --test-data data/raw/dataset_baseline_test.json
+      --model-output models/champion_model.pkl
+      --max-iter ${train.max_iter}
+    deps:
+      - data/raw/dataset_baseline_train.json
+      - data/raw/dataset_baseline_test.json
+      - src/training/train.py
+    outs:
+      - models/champion_model.pkl:
+          cache: true
+    params:
+      - train.max_iter
+      - train.test_size
+
+  evaluate:
+    cmd: >-
+      python -m src.training.evaluate
+      --model models/champion_model.pkl
+      --features-test data/processed/features_test.csv
+      --labels-test   data/processed/labels_test.csv
+      --output metrics/eval_metrics.json
+    deps:
+      - models/champion_model.pkl
+      - data/processed/features_test.csv
+      - data/processed/labels_test.csv
+      - src/training/evaluate.py
+    metrics:
+      - metrics/eval_metrics.json:
+          cache: false
+
+  sync_production_data:
+    cmd: >-
+      python scripts/sync_production_data.py
+      --sample-rate 0.1
+      --dvc-add
+    deps:
+      - scripts/sync_production_data.py
+    outs:
+      - data/sync:
+          cache: true
+          persist: false
+      - data/raw_signals:
+          cache: true
+          persist: false
+    desc: "Export production predictions, features, and signals to DagsHub for versioning"

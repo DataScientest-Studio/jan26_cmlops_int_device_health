@@ -1,0 +1,207 @@
+# =============================================================================
+# docker-compose.cloud.yml — CLOUD MODE OVERLAY
+# =============================================================================
+# Used with:  make cloud
+# Command:    docker compose --env-file .env.cloud --env-file .env.secrets \
+#               -f docker-compose.yml -f docker-compose.cloud.yml up -d
+#
+# LOCAL-FIRST MLFLOW ARCHITECTURE (Section 27)
+# ─────────────────────────────────────────────
+# All MLflow operations (training, promotion, Streamlit, API) use the local
+# buffer container (mlops_mlflow_buffer) as the PRIMARY tracking server.
+# DagsHub is the durable remote backup, written to only by the scheduled
+# sync_mlflow_to_dagshub DAG.
+#
+#   mlops_mlflow_buffer ← ALL live operations
+#         ↑ download (restore)
+#         ↓ upload   (scheduled sync DAG)
+#   DagsHub             ← remote ledger / backup only
+#
+# Benefits: zero DagsHub rate-limit exposure during operations, near-instant
+# Streamlit/API responses, reliable retraining DAG.
+#
+# Prerequisites:
+#   - DAGSHUB_USER, DAGSHUB_TOKEN, DAGSHUB_REPO set in .env.secrets
+#   - DagsHub repository created at https://dagshub.com
+# =============================================================================
+
+services:
+  # node_exporter uses profiles: [linux] in docker-compose.yml.
+  # The Makefile passes --profile linux automatically on Linux and macOS.
+  # On Windows Docker Desktop it is excluded. No override needed here.
+
+  # Disable the base mlflow service (local-mode only; not used in cloud mode).
+  mlflow:
+    deploy:
+      replicas: 0
+
+  # ── Dedicated PostgreSQL for MLflow Buffer (FU-1) ────────────────────────
+  # Isolated from mlops_postgres (app + Airflow DB) to ensure:
+  #   - Clean wipe semantics (remove this container/volume only)
+  #   - No write-pattern interference with application data
+  #   - Independent healthcheck (MLflow buffer can start independently)
+  # Host port 5434; internal port always 5432 (Docker network).
+  postgres_mlflow:
+    image: postgres:15
+    container_name: mlops_postgres_mlflow
+    environment:
+      POSTGRES_DB: ${MLFLOW_PG_DB:-mlops_mlflow}
+      POSTGRES_USER: ${MLFLOW_PG_USER:-mlflow_user}
+      POSTGRES_PASSWORD: ${MLFLOW_PG_PASSWORD:-changeme_mlflow}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.utf8"
+    volumes:
+      - mlflow_buffer_pg_data:/var/lib/postgresql/data
+    ports:
+      - "${MLFLOW_PG_PORT:-5434}:5432"
+    networks:
+      - mlops_network
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U ${MLFLOW_PG_USER:-mlflow_user} -d ${MLFLOW_PG_DB:-mlops_mlflow}"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Local-First MLflow Buffer ─────────────────────────────────────────────
+  # Primary MLflow tracking server for cloud mode.
+  # FU-1: Now uses a dedicated PostgreSQL backend (mlops_postgres_mlflow)
+  # instead of SQLite, providing ACID durability and reliable concurrent access.
+  # Port 5002 (host) → 5000 (container) to avoid clashing with local mode (5001).
+  # The mlflow_buffer_artifacts volume stores model artifacts (.pkl, plots).
+  mlflow_buffer:
+    image: ghcr.io/mlflow/mlflow:v3.9.0
+    container_name: mlops_mlflow_buffer
+    command: >
+      bash -c "pip install --quiet psycopg2-binary &&
+      mlflow server
+      --backend-store-uri postgresql://${MLFLOW_PG_USER:-mlflow_user}:${MLFLOW_PG_PASSWORD:-changeme_mlflow}@postgres_mlflow:5432/${MLFLOW_PG_DB:-mlops_mlflow}
+      --default-artifact-root mlflow-artifacts:/
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+      --host 0.0.0.0
+      --port 5000
+      --allowed-hosts \"*\""
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow_buffer:5000
+    volumes:
+      - mlflow_buffer_artifacts:/mlflow/artifacts
+    ports:
+      - "${MLFLOW_BUFFER_PORT:-5002}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres_mlflow:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # API: local-first — primary MLflow is the buffer container, not DagsHub.
+  # DagsHub credentials (USERNAME/PASSWORD) are removed from the API's env;
+  # the API never calls DagsHub directly.  Registry loads come from buffer.
+  api:
+    environment:
+      DEPLOYMENT_MODE: cloud
+      MODEL_REGISTRY_NAME: device_health_classifier_cloud
+      MLFLOW_TRACKING_URI: http://mlflow_buffer:5000
+      MLFLOW_TRACKING_USERNAME: ""
+      MLFLOW_TRACKING_PASSWORD: ""
+      MLFLOW_TRACKING_INSECURE_TLS: "false"
+      API_SECRET_KEY: ${API_SECRET_KEY:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      GIT_SHA: ${GIT_SHA:-unknown}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow_buffer:
+        condition: service_healthy
+
+  # Airflow: local-first — primary MLflow is the buffer.
+  # MLFLOW_DAGSHUB_URI is kept for the sync DAG (sync_mlflow_to_dagshub),
+  # which is the ONLY component that writes to DagsHub.
+  # DagsHub credentials are still needed for DVC push and the sync DAG.
+  airflow:
+    environment:
+      DEPLOYMENT_MODE: cloud
+      DATABASE_URL: postgresql://${DB_USER:-mlops_user}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-mlops_db}
+      MODEL_REGISTRY_NAME: device_health_classifier_cloud
+      MLFLOW_TRACKING_URI: http://mlflow_buffer:5000
+      MLFLOW_TRACKING_USERNAME: ""
+      MLFLOW_TRACKING_PASSWORD: ""
+      MLFLOW_DAGSHUB_URI: https://dagshub.com/${DAGSHUB_USER}/${DAGSHUB_REPO}.mlflow
+      MLFLOW_DAGSHUB_USERNAME: ${DAGSHUB_USER:-}
+      MLFLOW_DAGSHUB_PASSWORD: ${DAGSHUB_TOKEN:-}
+      MLFLOW_TRACKING_INSECURE_TLS: ${MLFLOW_TRACKING_INSECURE_TLS:-false}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      DAGSHUB_USER: ${DAGSHUB_USER:-}
+      DAGSHUB_TOKEN: ${DAGSHUB_TOKEN:-}
+      DAGSHUB_REPO: ${DAGSHUB_REPO:-}
+      GIT_USER_NAME: ${GIT_USER_NAME:-Airflow Bot}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-airflow@mlops.local}
+      GIT_SHA: ${GIT_SHA:-unknown}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow_buffer:
+        condition: service_healthy
+
+  # Challenger API: same local-first config as the primary API.
+  api_challenger:
+    environment:
+      DEPLOYMENT_MODE: cloud
+      MODEL_REGISTRY_NAME: device_health_classifier_cloud
+      MLFLOW_TRACKING_URI: http://mlflow_buffer:5000
+      MLFLOW_TRACKING_USERNAME: ""
+      MLFLOW_TRACKING_PASSWORD: ""
+      MLFLOW_TRACKING_INSECURE_TLS: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow_buffer:
+        condition: service_healthy
+
+  # postgres_mlflow_exporter - Exports metrics for the dedicated MLflow buffer
+  # PostgreSQL container (mlops_postgres_mlflow).  Available in cloud mode only.
+  # Metrics endpoint: http://mlops_postgres_mlflow_exporter:9187/metrics (host: 9188)
+  postgres_mlflow_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: mlops_postgres_mlflow_exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${MLFLOW_PG_USER:-mlflow_user}:${MLFLOW_PG_PASSWORD:-changeme_mlflow}@postgres_mlflow:5432/${MLFLOW_PG_DB:-mlops_mlflow}?sslmode=disable"
+    ports:
+      - "${POSTGRES_MLFLOW_EXPORTER_PORT:-9188}:9187"
+    depends_on:
+      postgres_mlflow:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9187/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+# Named volumes for the MLflow buffer container.
+# These are distinct from local-mode volumes (mlflow_db / mlflow_artifacts)
+# so that make local and make cloud never share MLflow data.
+# mlflow_buffer_db (SQLite) was removed in FU-1; replaced by mlflow_buffer_pg_data.
+volumes:
+  mlflow_buffer_pg_data:
+    driver: local
+  mlflow_buffer_artifacts:
+    driver: local

@@ -1,0 +1,184 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: mlops
+data:
+  nginx.conf: |
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        # Kubernetes DNS resolver
+        resolver kube-dns.kube-system.svc.cluster.local valid=10s ipv6=off;
+
+        upstream api {
+            server api:8000;
+            keepalive 32;
+        }
+
+        upstream streamlit {
+            server streamlit:8501;
+        }
+
+        upstream mlflow {
+            server mlflow:5000;
+        }
+
+        limit_req_zone $binary_remote_addr zone=api_limit:10m rate=600r/m;
+        limit_req_zone $binary_remote_addr zone=auth_limit:10m rate=60r/m;
+        limit_req_zone $binary_remote_addr zone=predict_limit:10m rate=6000r/m;
+        limit_conn_zone $binary_remote_addr zone=addr:10m;
+        client_max_body_size 10m;
+
+        gzip on;
+        gzip_vary on;
+        gzip_min_length 1024;
+        gzip_types text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss;
+
+        access_log /var/log/nginx/access.log;
+        error_log /var/log/nginx/error.log warn;
+
+        server {
+            listen 80;
+            server_name _;
+
+            location /nginx-health {
+                return 200 "OK\n";
+                access_log off;
+            }
+
+            # Direct API convenience routes — proxy to FastAPI without /api/ prefix.
+            # Allows both /health and /api/health, /docs and /api/docs, etc.
+            location = /health {
+                limit_req zone=api_limit burst=50 nodelay;
+                proxy_pass http://api/health;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 30s;
+            }
+
+            location = /docs {
+                proxy_pass http://api/docs;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 30s;
+            }
+
+            location = /redoc {
+                proxy_pass http://api/redoc;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 30s;
+            }
+
+            location = /openapi.json {
+                proxy_pass http://api/openapi.json;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 30s;
+            }
+
+            location /api/ {
+                limit_req zone=api_limit burst=50 nodelay;
+                limit_conn addr 20;
+                proxy_pass http://api/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_read_timeout 120s;
+                proxy_connect_timeout 10s;
+            }
+
+            # Direct API routes (no /api/ prefix) — used by Streamlit frontend
+            location /predict {
+                limit_req zone=predict_limit burst=1500 nodelay;
+                proxy_pass http://api/predict;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                add_header 'Access-Control-Allow-Origin' '*' always;
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+                add_header 'Access-Control-Allow-Headers' 'Content-Type,Authorization,X-API-Key' always;
+                proxy_read_timeout 60s;
+                proxy_connect_timeout 30s;
+                proxy_buffering off;
+            }
+
+            location /labels {
+                limit_req zone=api_limit burst=50 nodelay;
+                proxy_pass http://api/labels;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                add_header 'Access-Control-Allow-Origin' '*' always;
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+                add_header 'Access-Control-Allow-Headers' 'Content-Type,Authorization,X-API-Key' always;
+                proxy_read_timeout 30s;
+            }
+
+            location /stats {
+                limit_req zone=api_limit burst=50 nodelay;
+                proxy_pass http://api/stats;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 30s;
+            }
+
+            location /evaluate {
+                limit_req zone=api_limit burst=50 nodelay;
+                proxy_pass http://api/evaluate;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 60s;
+            }
+
+            location /admin/ {
+                proxy_pass http://api/admin/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 60s;
+                proxy_connect_timeout 10s;
+            }
+
+            location /model/ {
+                proxy_pass http://api/model/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 30s;
+            }
+
+            location /k8s/ {
+                proxy_pass http://api/k8s/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 30s;
+            }
+
+            location /mlflow/ {
+                proxy_pass http://mlflow/;
+                proxy_hide_header X-Frame-Options;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                add_header X-Frame-Options "ALLOWALL" always;
+                proxy_buffering off;
+                proxy_read_timeout 120s;
+            }
+
+            location / {
+                proxy_pass http://streamlit/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+                proxy_read_timeout 86400s;
+            }
+        }
+    }

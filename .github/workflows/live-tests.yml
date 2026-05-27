@@ -1,0 +1,116 @@
+name: Live Docker Stack Tests
+
+# This workflow starts the full local Docker stack and runs all
+# @pytest.mark.live tests against it.
+#
+# It runs:
+#   - Manually (workflow_dispatch)
+#   - Nightly at 02:00 UTC on main
+#   - On PRs that touch docker-compose files, airflow DAGs, or the API
+#
+# The fast unit/integration suite (no Docker) runs in test.yml on every push.
+
+on:
+  workflow_dispatch:   # manual trigger from GitHub UI
+
+  # schedule:
+  #   - cron: "0 2 * * *"   # disabled — repo is a project archive, not actively maintained
+
+  pull_request:
+    paths:
+      - "docker-compose*.yml"
+      - "airflow/dags/**"
+      - "src/api/**"
+      - "nginx/**"
+      - "prometheus/**"
+      - "grafana/**"
+      - "tests/integration/test_live_docker_stack.py"
+      - "tests/integration/test_airflow_live.py"
+      - "tests/integration/conftest.py"
+
+jobs:
+  live-tests:
+    name: Live Docker stack tests
+    runs-on: ubuntu-latest
+
+    env:
+      # Tell the conftest fixture to leave Docker up after tests finish
+      # (CI cleans up the runner anyway, so this just avoids a redundant `down`)
+      DOCKER_KEEP_UP: "1"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      # ------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install Python dependencies
+        run: uv sync --dev
+
+      # ------------------------------------------------------------------
+      # Create a minimal .env.secrets so docker compose doesn't fail on
+      # missing variable substitutions.  Real DagsHub / AWS creds are not
+      # needed for the local stack tests.
+      - name: Create .env.secrets for CI
+        run: |
+          # Generate a fresh, disposable Fernet key for this CI run — no key stored in source
+          FERNET_KEY=$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')
+          cat > .env.secrets << EOF
+          DB_PASSWORD=ci_test_password
+          AIRFLOW_PASSWORD=ci_test_password
+          AIRFLOW_FERNET_KEY=${FERNET_KEY}
+          AIRFLOW_SECRET_KEY=ci_secret_key_placeholder_32_chars_long_x
+          GRAFANA_PASSWORD=ci_test_password
+          DAGSHUB_USER=ci_test_user
+          DAGSHUB_TOKEN=ci_test_token
+          DAGSHUB_REPO=mlops-device-health
+          AWS_ACCESS_KEY_ID=ci_test_user
+          AWS_SECRET_ACCESS_KEY=ci_test_token
+          ALERT_EMAIL_FROM=alertmanager@ci.local
+          ALERT_SMTP_USERNAME=ci@example.com
+          ALERT_SMTP_PASSWORD=ci_smtp_password
+          EOF
+
+      # ------------------------------------------------------------------
+      # Ensure bootstrap model exists for the API container
+      - name: Ensure bootstrap model exists
+        run: |
+          if [ ! -f "models/bootstrap_model.pkl" ]; then
+            echo "⚠️  bootstrap_model.pkl missing — generating CI fallback..."
+            mkdir -p models
+            uv run python scripts/ci_generate_bootstrap_model.py
+          else
+            echo "✅ bootstrap_model.pkl found"
+          fi
+
+      # ------------------------------------------------------------------
+      # The conftest.py docker_stack fixture handles `docker compose up -d`
+      # and health polling automatically.  We just run pytest.
+      # Timeout budget: 600 s (docker compose up) + 120 s (health poll) +
+      # 180 s buffer = 900 s max fixture setup, 60 s per individual test.
+      - name: Run live tests
+        run: |
+          uv run pytest tests/ -v --tb=short -m live \
+            --no-cov \
+            --timeout=900
+
+      # ------------------------------------------------------------------
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          docker compose \
+            --env-file .env \
+            --env-file .env.secrets \
+            -f docker-compose.yml \
+            -f docker-compose.local.yml \
+            logs --tail=100

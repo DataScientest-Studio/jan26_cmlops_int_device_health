@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlops-config
+  namespace: mlops
+data:
+  # Database
+  DB_NAME: "mlops_k8s"
+  DB_USER: "mlops_user"
+  DATABASE_URL: "postgresql://mlops_user:$(DB_PASSWORD)@postgres:5432/mlops_k8s"
+  # Service URLs (K4 — intra-cluster routing)
+  MLOPS_API_URL: "http://api:8000"
+  AIRFLOW_API_URL: "http://airflow:8080"
+  # MLflow
+  MLFLOW_TRACKING_URI: "http://mlflow:5000"
+  MLFLOW_EXPERIMENT_NAME: "automated_retraining_k8s"
+  # Model registry
+  MODEL_REGISTRY_NAME: "device_health_classifier_k8s"
+  MODEL_REGISTRY_STAGE: "Production"
+  MODEL_REGISTRY_ENABLED: "true"
+  MODEL_REGISTRY_TIMEOUT: "120"
+  # Training
+  SLIDING_WINDOW_DAYS: "90"
+  K_RANGE_MIN: "2"
+  K_RANGE_MAX: "5"
+  CHAMPION_PROMOTION_THRESHOLD: "0.02"
+  # Airflow
+  AIRFLOW_USER: "admin"
+  # Deployment mode — "cloud" enables Airflow DAGs and cloud MLflow registry
+  DEPLOYMENT_MODE: "cloud"
+  # Environment marker for Streamlit UI detection (kubernetes vs docker-compose)
+  MLOPS_ENVIRONMENT: "kubernetes"
+  # Logging
+  LOG_LEVEL: "INFO"
+  PYTHONUNBUFFERED: "1"
+  # Python path for DAG task subprocesses to import from src.*
+  # (mirrors docker-compose.yml: PYTHONPATH=/opt/airflow where src/ is mounted)
+  PYTHONPATH: "/opt/airflow"
+  # Grafana
+  GF_SECURITY_ADMIN_USER: "admin"
+  GF_SERVER_ROOT_URL: "http://localhost:3000"
+  GF_AUTH_ANONYMOUS_ENABLED: "false"
+  GF_SECURITY_ALLOW_EMBEDDING: "true"
+  GF_SECURITY_X_FRAME_OPTIONS_HEADER: ""

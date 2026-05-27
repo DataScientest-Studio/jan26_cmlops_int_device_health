@@ -1,0 +1,508 @@
+# =============================================================================
+# Prometheus Alert Rules — MLOps Device Health
+# =============================================================================
+#
+# SINGLE SOURCE OF TRUTH for all alerting.
+# Grafana is used for DISPLAY only — no alert rules exist in Grafana.
+#
+# Metric names are verified against src/monitoring/metrics.py.
+#
+# Platform note (system_alerts):
+#   node_exporter metrics work on Linux and macOS only.
+#   On Windows Docker Desktop, node_exporter is excluded via `profiles: [linux]`
+#   and its scrape target returns up=0 — the CPU/memory/disk alerts below will
+#   produce no-data (not false positives) on Windows. They fire correctly on
+#   Linux/macOS. ContainerDown is restricted to cAdvisor only (always running).
+#
+#   NodeExporterDown carries a `platform: windows` label so Alertmanager can
+#   route it to the null receiver (suppressed) on Windows deployments.
+# =============================================================================
+
+groups:
+
+  # ===========================================================================
+  # API Alerts — FastAPI prediction service health
+  # Metric names verified: api_requests_total, api_errors_total,
+  #   api_request_duration_seconds, model_predictions_total
+  # ===========================================================================
+  - name: api_alerts
+    interval: 30s
+    rules:
+
+      - alert: APIDown
+        expr: up{job="mlops_api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "API service is down"
+          description: "The MLOps API (job=mlops_api) has been unreachable for more than 1 minute. Predictions cannot be served."
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(api_errors_total[5m]))
+            /
+            (sum(rate(api_requests_total[5m])) + 0.001)
+          ) * 100 > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "High API error rate: {{ $value | humanize }}%"
+          description: "More than 5% of requests are failing. Current rate: {{ $value | humanize }}%."
+
+      - alert: CriticalErrorRate
+        expr: |
+          (
+            sum(rate(api_errors_total[5m]))
+            /
+            (sum(rate(api_requests_total[5m])) + 0.001)
+          ) * 100 > 10
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "CRITICAL API error rate: {{ $value | humanize }}%"
+          description: "More than 10% of requests are failing. Immediate investigation required."
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(api_request_duration_seconds_bucket[5m])) by (le)
+          ) * 1000 > 500
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "High API latency — P95: {{ $value | humanize }}ms"
+          description: "95th-percentile latency exceeds 500ms. Current P95: {{ $value | humanize }}ms."
+
+      - alert: VeryHighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(api_request_duration_seconds_bucket[5m])) by (le)
+          ) * 1000 > 1000
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "CRITICAL API latency — P95: {{ $value | humanize }}ms"
+          description: "95th-percentile latency exceeds 1000ms. Service is severely degraded."
+
+      - alert: LowPredictionRate
+        expr: |
+          sum(rate(model_predictions_total[5m])) < 0.1
+        for: 15m
+        labels:
+          severity: warning
+          component: model
+        annotations:
+          summary: "Low prediction rate: {{ $value | humanize }} pred/s"
+          description: "Less than 0.1 predictions/second for 15 minutes. API may be idle or receiving no traffic."
+
+  # ===========================================================================
+  # Model Alerts — ML model health and accuracy
+  # Metric names verified: model_accuracy_gauge, model_predictions_total,
+  #   model_prediction_confidence, model_last_reload_timestamp_seconds
+  # ===========================================================================
+  - name: model_alerts
+    interval: 1m
+    rules:
+
+      - alert: ModelAccuracyDrop
+        expr: |
+          model_accuracy_gauge < 0.85
+        for: 15m
+        labels:
+          severity: warning
+          component: model
+        annotations:
+          summary: "Model accuracy below 85%: {{ $value | humanizePercentage }}"
+          description: "Realized accuracy on labeled predictions has been below 85% for 15 minutes. Consider triggering retraining (UC-04)."
+
+      # Re-enabled: model_last_reload_timestamp_seconds added to metrics.py
+      # and set in record_model_reload(). Fires if the model has not been
+      # reloaded for 7 days.
+      - alert: ModelVersionStale
+        expr: |
+          (time() - model_last_reload_timestamp_seconds) > 604800
+        for: 1h
+        labels:
+          severity: info
+          component: model
+        annotations:
+          summary: "Model has not been reloaded in 7 days"
+          description: "The loaded model version is {{ $value | humanizeDuration }} old. Consider triggering a retraining or reload cycle via UC-04."
+
+      - alert: HighPredictionConfidenceDropout
+        expr: |
+          histogram_quantile(
+            0.50,
+            sum(rate(model_prediction_confidence_bucket[10m])) by (le)
+          ) < 0.60
+        for: 30m
+        labels:
+          severity: warning
+          component: model
+        annotations:
+          summary: "Low prediction confidence — median: {{ $value | humanizePercentage }}"
+          description: "The model is consistently uncertain. Median confidence has been below 60% for 30 minutes."
+
+      - alert: PredictionDistributionSkew
+        expr: |
+          (
+            sum(rate(model_predictions_total{predicted_label="0"}[1h]))
+            /
+            (sum(rate(model_predictions_total[1h])) + 0.001)
+          ) < 0.50
+        for: 10m
+        labels:
+          severity: info
+          component: model
+        annotations:
+          summary: "Prediction distribution skewed — healthy rate: {{ $value | humanizePercentage }}"
+          description: "Less than 50% of predictions are 'healthy'. Expected baseline ~70%. Possible concept drift."
+
+  # ===========================================================================
+  # Data Quality Alerts — label coverage, drift detection (all drift types)
+  # Metric names verified: sparse_label_coverage, drift_detected_gauge,
+  #   labels_injected_total, model_accuracy_gauge
+  # ===========================================================================
+  - name: data_quality_alerts
+    interval: 1m
+    rules:
+
+      - alert: DriftDetected
+        expr: |
+          drift_detected_gauge{drift_type="data"} > 0
+          or drift_detected_gauge{drift_type="concept"} > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: drift
+        annotations:
+          summary: "Drift detected: {{ $labels.drift_type }}"
+          description: "{{ $labels.drift_type }} drift has been detected in production signals. Consider triggering UC-04 retraining."
+
+      # UC-20 — Moved from Grafana (was drift-prediction-detected).
+      # Prometheus is the single source of truth; Grafana is display-only.
+      - alert: PredictionDriftDetected
+        expr: |
+          drift_detected_gauge{drift_type="prediction"} > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: drift
+          uc: UC-20
+        annotations:
+          summary: "Prediction drift detected (UC-20) — model output distribution shifted"
+          description: "{{ $value }} report(s) show prediction drift. The distribution of model outputs has changed significantly from the reference baseline. Run simulate_prediction_drift.py or retrain the model."
+
+      - alert: HighDriftRate
+        expr: |
+          sum(drift_detected_gauge) > 2
+        for: 5m
+        labels:
+          severity: critical
+          component: drift
+        annotations:
+          summary: "High drift rate — {{ $value }} drift types active"
+          description: "3 or more drift types detected simultaneously. Immediate investigation and retraining recommended."
+
+      - alert: LowLabelCoverage
+        expr: |
+          sparse_label_coverage < 0.50
+        for: 1h
+        labels:
+          severity: warning
+          component: data
+        annotations:
+          summary: "Label coverage below 50%: {{ $value | humanizePercentage }}"
+          description: "Less than 50% of predictions have ground truth labels. Retraining quality may be insufficient."
+
+      - alert: CriticalLabelCoverage
+        expr: |
+          sparse_label_coverage < 0.30
+        for: 30m
+        labels:
+          severity: critical
+          component: data
+        annotations:
+          summary: "CRITICAL label coverage: {{ $value | humanizePercentage }}"
+          description: "Less than 30% of predictions are labeled. Retraining will likely fail or produce an unreliable model."
+
+      - alert: NoLabelsInjected
+        expr: |
+          increase(labels_injected_total[24h]) == 0
+        for: 24h
+        labels:
+          severity: warning
+          component: data
+        annotations:
+          summary: "No labels injected in 24 hours"
+          description: "No ground truth labels have been added in 24 hours. Label injection pipeline may be broken."
+
+      # Composite MLOps alert: drift AND accuracy degradation simultaneously.
+      # This is the core MLOps narrative: the model has degraded because of drift.
+      - alert: DriftCausedAccuracyDrop
+        expr: |
+          (
+            drift_detected_gauge{drift_type="data"} > 0
+            or drift_detected_gauge{drift_type="concept"} > 0
+          )
+          and model_accuracy_gauge < 0.85
+        for: 10m
+        labels:
+          severity: critical
+          component: drift
+        annotations:
+          summary: "Drift detected AND model accuracy dropped below 85%"
+          description: "Both drift and accuracy degradation are active simultaneously. This is a retraining trigger condition — run UC-04."
+
+  # ===========================================================================
+  # System Alerts — infrastructure health
+  #
+  # node_exporter metrics (HighCPUUsage, HighMemoryUsage, CriticalMemoryUsage,
+  # DiskSpaceLow) require node_exporter to be running. On Linux and macOS,
+  # node_exporter runs and these alerts are active. On Windows Docker Desktop,
+  # node_exporter is excluded via profiles: [linux] — these alerts produce
+  # no-data (they do NOT fire as false positives).
+  #
+  # ContainerDown monitors cAdvisor only — cAdvisor runs on all platforms.
+  # NodeExporterDown carries platform: windows label so Alertmanager can
+  # route it to the null (suppress) receiver on Windows deployments.
+  # ===========================================================================
+  - name: system_alerts
+    interval: 30s
+    rules:
+
+      # cAdvisor monitors all platforms. Only check cAdvisor here.
+      - alert: ContainerDown
+        expr: up{job="cadvisor"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "cAdvisor is unreachable"
+          description: "cAdvisor (container metrics) has been down for 2 minutes. Container-level monitoring is unavailable."
+
+      # NodeExporterDown: carries platform=windows label so Alertmanager routes
+      # it to the null receiver on this Windows deployment. On Linux/macOS the
+      # alert never fires because up{job="node_exporter"} == 1.
+      - alert: NodeExporterDown
+        expr: up{job="node_exporter"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+          platform: windows
+        annotations:
+          summary: "node_exporter is down — host metrics unavailable"
+          description: "node_exporter has been unreachable for 5 minutes. CPU/memory/disk host metrics are unavailable. On Windows Docker Desktop this is expected — node_exporter is excluded via profiles: [linux]. Suppressed by Alertmanager on this deployment."
+
+      # Requires node_exporter — active on Linux/macOS, silent on Windows.
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 10m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "High host CPU usage: {{ $value | humanize }}%"
+          description: "Host CPU usage has been above 80% for 10 minutes. Active on Linux/macOS only."
+
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "High host memory usage: {{ $value | humanize }}%"
+          description: "Host memory usage above 85% for 5 minutes. Active on Linux/macOS only."
+
+      - alert: CriticalMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "CRITICAL host memory: {{ $value | humanize }}%"
+          description: "Host memory above 95%. OOM-kill risk. Active on Linux/macOS only."
+
+      - alert: DiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|fuse.lxcfs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) * 100 < 15
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "Low disk space on {{ $labels.mountpoint }}: {{ $value | humanize }}% free"
+          description: "Available disk space below 15% on {{ $labels.instance }}. Active on Linux/macOS only."
+
+      # MLflow buffer liveness check via blackbox probe (all platforms)
+      # Uses probe_success from blackbox_mlflow job — avoids JSON /health parse error
+      - alert: MLflowBufferDown
+        expr: probe_success{job="blackbox_mlflow"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          component: mlflow
+        annotations:
+          summary: "MLflow buffer service is unreachable"
+          description: "The MLflow buffer (experiment tracking) has been down for 2 minutes. Model run logging is failing."
+
+      # PostgreSQL app database health (via postgres_exporter)
+      # pg_up = 0 means the exporter cannot connect to PostgreSQL itself.
+      - alert: PostgresAppDown
+        expr: pg_up{job="postgres_app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "PostgreSQL application database is unreachable"
+          description: "postgres_exporter (job=postgres_app) cannot connect to PostgreSQL. The application database is down — predictions and label injection will fail."
+
+      # PostgreSQL MLflow database health (cloud mode only — postgres_mlflow scrape job)
+      - alert: PostgresMLflowDown
+        expr: pg_up{job="postgres_mlflow"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: mlflow
+        annotations:
+          summary: "PostgreSQL MLflow database is unreachable"
+          description: "postgres_mlflow_exporter (job=postgres_mlflow) cannot connect to the MLflow PostgreSQL database. Experiment tracking persistence is unavailable."
+
+      # Nginx reverse proxy health (via blackbox_exporter HTTP probe)
+      # probe_success=0 means the http_2xx module got no valid 2xx response.
+      - alert: NginxDown
+        expr: probe_success{job="blackbox_nginx"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "Nginx reverse proxy is unreachable"
+          description: "HTTP health probe for Nginx (job=blackbox_nginx) has been failing for 2 minutes. All external API and UI access is blocked."
+
+      # Airflow webserver health (via blackbox_exporter HTTP probe)
+      - alert: AirflowDown
+        expr: probe_success{job="blackbox_airflow"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "Airflow webserver is unreachable"
+          description: "HTTP health probe for Airflow (job=blackbox_airflow) has been failing for 2 minutes. DAG scheduling and monitoring UI is unavailable."
+
+  # ===========================================================================
+  # Retraining Alerts — automated retraining pipeline health
+  # Metric names verified: retraining_triggers_total, retraining_failures_total,
+  #   model_last_reload_timestamp_seconds
+  # ===========================================================================
+  - name: retraining_alerts
+    interval: 1m
+    rules:
+
+      # Re-enabled: retraining_failures_total added to metrics.py.
+      # Increment this counter in the Airflow retraining DAG on failure.
+      - alert: RetrainingFailed
+        expr: |
+          increase(retraining_failures_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: retraining
+        annotations:
+          summary: "Retraining pipeline failed in the last hour"
+          description: "{{ $value | humanize }} retraining failure(s) in the last hour. Check Airflow DAG logs for root cause."
+
+      - alert: FrequentRetraining
+        expr: |
+          increase(retraining_triggers_total[24h]) > 10
+        for: 1h
+        labels:
+          severity: info
+          component: retraining
+        annotations:
+          summary: "High retraining frequency: {{ $value }} triggers in 24h"
+          description: "More than 10 retraining triggers in 24 hours. Drift detection threshold may be too sensitive."
+
+      # Re-enabled: both model_last_reload_timestamp_seconds and
+      # retraining_triggers_total are now available.
+      - alert: NoRetrainingInWeek
+        expr: |
+          (time() - model_last_reload_timestamp_seconds) > 604800
+          and increase(retraining_triggers_total[168h]) == 0
+        for: 1h
+        labels:
+          severity: info
+          component: retraining
+        annotations:
+          summary: "No retraining for 7 days — model may be stale"
+          description: "The model has not been reloaded and no retraining has been triggered in 7 days. Consider running a manual retraining cycle."
+
+  # ===========================================================================
+  # Alert Catalog — static recording rule used by the Grafana
+  # "Normal / No-Data Alerts" dashboard panel.
+  #
+  # The panel query is:
+  #   mlops_alert_catalog unless on(alertname) ALERTS
+  #
+  # This shows every alert rule in the catalog that is NOT currently in the
+  # ALERTS time series (i.e. neither firing nor pending = "Normal" state).
+  # When a new alert rule is added to this file it must also be listed here.
+  # ===========================================================================
+  - name: alert_catalog
+    interval: 60s
+    rules:
+      - record: mlops_alert_catalog
+        expr: >
+          label_replace(label_replace(vector(1), "alertname", "APIDown",                          "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "HighErrorRate",                 "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "CriticalErrorRate",             "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "HighLatency",                   "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "VeryHighLatency",               "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "LowPredictionRate",             "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "ModelAccuracyDrop",             "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "ModelVersionStale",             "", ""), "severity", "info",     "", "")
+          or label_replace(label_replace(vector(1), "alertname", "HighPredictionConfidenceDropout","", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "PredictionDistributionSkew",    "", ""), "severity", "info",     "", "")
+          or label_replace(label_replace(vector(1), "alertname", "DriftDetected",                 "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "PredictionDriftDetected",       "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "HighDriftRate",                 "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "LowLabelCoverage",              "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "CriticalLabelCoverage",         "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "NoLabelsInjected",              "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "DriftCausedAccuracyDrop",       "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "ContainerDown",                 "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "NodeExporterDown",              "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "HighCPUUsage",                  "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "HighMemoryUsage",               "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "CriticalMemoryUsage",           "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "DiskSpaceLow",                  "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "MLflowBufferDown",              "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "PostgresAppDown",               "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "PostgresMLflowDown",            "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "NginxDown",                     "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "AirflowDown",                   "", ""), "severity", "warning",  "", "")
+          or label_replace(label_replace(vector(1), "alertname", "RetrainingFailed",              "", ""), "severity", "critical", "", "")
+          or label_replace(label_replace(vector(1), "alertname", "FrequentRetraining",            "", ""), "severity", "info",     "", "")
+          or label_replace(label_replace(vector(1), "alertname", "NoRetrainingInWeek",            "", ""), "severity", "info",     "", "")

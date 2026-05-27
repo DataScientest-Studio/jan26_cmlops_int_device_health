@@ -1,0 +1,329 @@
+name: Deploy to Kubernetes (Kind CI)
+
+# ─── When this workflow runs ──────────────────────────────────────────────────
+# Automatic:  After the build workflow succeeds on main (images pushed to GHCR).
+# Manual:     workflow_dispatch from GitHub UI or Streamlit "Trigger CI/CD Deploy" button.
+#
+# Strategy: Spin up a temporary Kind (Kubernetes-in-Docker) cluster inside the
+# GitHub Actions runner, deploy the K8s manifests using the GHCR images that
+# were just pushed, and smoke-test the API /health endpoint.  No external
+# cluster or cloud infrastructure required.
+
+on:
+  # Run automatically when build workflow completes on main
+  workflow_run:
+    workflows: ["Build and Push Docker Images"]
+    types: [completed]
+    branches: [main]
+
+  # Allow manual trigger from GitHub UI or Streamlit
+  workflow_dispatch:
+    inputs:
+      overlay:
+        description: "Kustomize overlay to deploy (ghcr / local / cloud)"
+        required: false
+        default: "ghcr"
+        type: choice
+        options:
+          - ghcr
+          - local
+          - cloud
+      reason:
+        description: "Reason for manual trigger"
+        required: false
+        default: "Manual deployment"
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # The overlay used for CI deployments
+  K8S_OVERLAY: ${{ github.event.inputs.overlay || 'ghcr' }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # ── Guard: only run if build succeeded (when triggered by workflow_run) ────
+  check-trigger:
+    name: Check trigger condition
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Determine if deployment should run
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Build workflow did not succeed (conclusion=${{ github.event.workflow_run.conclusion }}). Skipping K8s deploy."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Main deployment job ────────────────────────────────────────────────────
+  deploy-kind:
+    name: Deploy to Kind cluster
+    runs-on: ubuntu-latest
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_run == 'true'
+
+    steps:
+      # ── 0. Free up disk space ─────────────────────────────────────────────
+      # The three Docker images (api + streamlit + airflow) can exceed 6 GB
+      # combined.  kind load docker-image internally calls 'docker save' which
+      # writes a .tar to /tmp.  On the default ubuntu-latest runner (14 GB
+      # available) this exhausts the disk.  Remove large pre-installed tools
+      # that are unused in this workflow to free ~10 GB before building.
+      - name: Free up runner disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          docker system prune -af --volumes 2>/dev/null || true
+          df -h
+
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Create Kind cluster ────────────────────────────────────────────
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: mlops-ci
+          # kind-action expects a FILE PATH for config, not inline YAML.
+          # The kind-cluster.yaml file lives in .github/ and is committed to the repo.
+          config: .github/kind-cluster.yaml
+
+      # ── 3. Verify cluster is healthy ──────────────────────────────────────
+      - name: Verify cluster
+        run: |
+          kubectl config use-context kind-mlops-ci
+          kubectl cluster-info --context kind-mlops-ci
+          kubectl get nodes
+
+      # ── 4. Set up secret.yaml from GitHub Secrets ────────────────────────
+      # The secret.yaml is git-ignored (contains real credentials).
+      # In CI we generate it from GitHub Actions secrets.
+      - name: Create Kubernetes secret manifest
+        run: |
+          cat > k8s/base/secret.yaml << 'EOF'
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mlops-secrets
+            namespace: mlops
+          type: Opaque
+          stringData:
+            DB_PASSWORD: "${{ secrets.K8S_DB_PASSWORD || 'ci_test_password' }}"
+            AIRFLOW_PASSWORD: "${{ secrets.K8S_AIRFLOW_PASSWORD || 'ci_test_password' }}"
+            API_SECRET_KEY: "${{ secrets.K8S_API_SECRET_KEY || 'ci_test_secret_key_min_32_chars_here' }}"
+            GF_SECURITY_ADMIN_PASSWORD: "${{ secrets.K8S_GRAFANA_PASSWORD || 'ci_test_password' }}"
+            MLFLOW_TRACKING_USERNAME: "${{ secrets.K8S_MLFLOW_USERNAME || 'ci_user' }}"
+            MLFLOW_TRACKING_PASSWORD: "${{ secrets.K8S_MLFLOW_PASSWORD || 'ci_token' }}"
+          EOF
+
+      # ── 5. Log in to GHCR ─────────────────────────────────────────────────
+      - name: Log in to Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 6. Pre-pull GHCR images into Kind nodes ──────────────────────────
+      # Kind runs containers in its own Docker environment. Images must be
+      # explicitly loaded into Kind nodes, otherwise imagePullPolicy=Always
+      # will attempt to pull — which works for public images but GHCR packages
+      # need auth within the Kind node context.
+      # Simplest approach: pull locally → kind load → deploy with IfNotPresent.
+      # ── DISK-BUDGET NOTE ─────────────────────────────────────────────────────
+      # The CI runner has ~14 GB of free disk after the cleanup in Step 0.
+      # Loading api + streamlit + airflow from GHCR into Kind costs ~7 GB plus
+      # temporary tar space, exhausting the disk and causing the Kind node
+      # filesystem to fill up.  When the Kind node filesystem is full, even
+      # emptyDir-backed containers (postgres) cannot write to their data dirs
+      # and fail to start.
+      #
+      # FIX: Only load the api image (~2 GB) into Kind from GHCR.
+      # streamlit and airflow are NOT needed for the smoke test (GET /api/health).
+      # They will be in ImagePullBackOff but that does not affect the test.
+      # postgres:15 and nginx:alpine are pre-loaded separately (both are small
+      # public images) in Step 6b.
+      - name: Pull GHCR images and load into Kind
+        run: |
+          df -h
+          # Only load the api image — streamlit and airflow are not needed for
+          # the smoke test and their combined size (~4 GB) exhausts the runner disk.
+          for img in api; do
+            FULL_IMG="ghcr.io/${GITHUB_OWNER:-your-github-username}/mlops-device-health-${img}:main"
+            echo "Pulling ${FULL_IMG}..."
+            if docker pull "${FULL_IMG}" 2>/dev/null; then
+              docker tag "${FULL_IMG}" "mlops-device-health/${img}:latest"
+              if kind load docker-image "mlops-device-health/${img}:latest" --name mlops-ci; then
+                echo "✅ Loaded ${img}"
+              else
+                echo "❌ kind load failed for ${img} — disk may be full"
+                df -h
+                exit 1
+              fi
+            else
+              echo "⚠️  Could not pull ${FULL_IMG} — image may not exist yet (first push?)"
+              echo "Building fallback api image from source..."
+              GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+              docker build --build-arg GIT_SHA="${GIT_SHA}" -t "mlops-device-health/api:latest" -f docker/api.Dockerfile .
+              if kind load docker-image "mlops-device-health/api:latest" --name mlops-ci; then
+                echo "✅ Built + loaded fallback api"
+              else
+                echo "❌ kind load failed for fallback api — disk may be full"
+                df -h
+                exit 1
+              fi
+            fi
+          done
+          df -h
+
+      # ── 6b. Pre-pull small public images into Kind nodes ────────────────────
+      # postgres:15 (~550 MB) and nginx:alpine (~40 MB) are both needed for
+      # the smoke test (postgres for the API, nginx for the NodePort routing).
+      # Pre-loading avoids Docker Hub pulls inside the Kind node at deploy time
+      # and removes any risk of Docker Hub rate limits failing the pod start.
+      # NOTE: both docker pull AND kind load exit codes are checked.
+      - name: Pull postgres and nginx images into Kind
+        run: |
+          df -h
+          for img_tag in "postgres:15" "nginx:alpine"; do
+            echo "Pulling ${img_tag}..."
+            if docker pull "${img_tag}"; then
+              if kind load docker-image "${img_tag}" --name mlops-ci; then
+                echo "✅ ${img_tag} loaded into Kind"
+              else
+                echo "⚠️  kind load failed for ${img_tag} — Kind will pull on demand"
+              fi
+            else
+              echo "⚠️  docker pull ${img_tag} failed — Kind will pull on demand"
+            fi
+          done
+          df -h
+
+      # ── 6c. Patch postgres deployment to use emptyDir (CI only) ──────────────
+      # Belt-and-suspenders: even though we greatly reduce disk usage by only
+      # loading the api image, the postgres deployment still references a PVC.
+      # Patch it to emptyDir so that even if local-path-provisioner fails
+      # (e.g. residual disk pressure), postgres still starts for the smoke test.
+      # Using sed for surgical in-place replacement — no YAML round-trip risks.
+      - name: Patch postgres deployment for CI (emptyDir instead of PVC)
+        run: |
+          echo "Before patch:"
+          grep -A3 'volumes:' k8s/base/postgres/deployment.yaml | tail -5
+          # Replace the PVC volume spec with emptyDir using surgical sed
+          sed -i \
+            -e 's|          persistentVolumeClaim:|          emptyDir: {}|' \
+            -e '/            claimName: postgres-pvc/d' \
+            k8s/base/postgres/deployment.yaml
+          echo "After patch:"
+          grep -A3 'volumes:' k8s/base/postgres/deployment.yaml | tail -5
+          # Verify patch was applied
+          if grep -q 'emptyDir' k8s/base/postgres/deployment.yaml; then
+            echo "✅ Patched postgres-data volume: PVC → emptyDir"
+          else
+            echo "❌ Patch failed — emptyDir not found in deployment.yaml"
+            exit 1
+          fi
+
+      # ── 7. Patch overlay to use IfNotPresent (images already loaded) ──────
+      # Since images are loaded into Kind nodes directly, we use the local
+      # overlay with IfNotPresent policy — avoids registry auth complications.
+      # Kind uses 'standard' storage class; the local overlay targets Docker
+      # Desktop's 'hostpath' class, so patch before applying.
+      - name: Deploy K8s manifests (local overlay, pre-loaded images)
+        run: |
+          # Kind's default StorageClass is 'standard' (local-path); the local
+          # overlay patches PVCs to 'hostpath' for Docker Desktop.  Rewrite to
+          # 'standard' so PVCs bind correctly in the Kind CI cluster.
+          sed -i 's/storageClassName: hostpath/storageClassName: standard/g' \
+            k8s/overlays/local/kustomization.yaml
+          kubectl apply --server-side --force-conflicts -k k8s/overlays/local
+          echo "Applied manifests. Waiting for core services..."
+
+      # ── 8. Wait for core services ─────────────────────────────────────────
+      # Timeout increased to 300 s (was 180 s) since infrastructure images
+      # are now pre-loaded but the local-path-provisioner still needs to
+      # provision PVCs and postgres needs to run initdb on first start.
+      - name: Wait for PostgreSQL
+        run: |
+          kubectl rollout status deployment/postgres -n mlops --timeout=300s
+
+      - name: Wait for API deployment
+        run: |
+          kubectl rollout status deployment/api -n mlops --timeout=300s
+
+      # ── 9. Smoke test: API /health ────────────────────────────────────────
+      - name: Smoke test — API health check
+        run: |
+          echo "Waiting for API to be reachable on NodePort 30080..."
+          for i in {1..30}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:30080/api/health 2>/dev/null || echo "000")
+            echo "Attempt ${i}/30: HTTP ${STATUS}"
+            if [[ "${STATUS}" == "200" ]]; then
+              echo "✅ API is healthy!"
+              curl -s http://localhost:30080/api/health | python3 -m json.tool
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ API did not become healthy within 150 seconds."
+          echo "--- Pod status ---"
+          kubectl get pods -n mlops
+          echo "--- API pod logs ---"
+          kubectl logs -n mlops -l app=api --tail=50 || true
+          exit 1
+
+      # ── 10. Verify K8s resources ──────────────────────────────────────────
+      - name: Show final cluster state
+        if: always()
+        run: |
+          # Use set +e so individual kubectl failures do not fail this diagnostic step
+          set +e
+          kubectl config use-context kind-mlops-ci 2>/dev/null || true
+          echo "=== Pods ==="
+          kubectl get pods -n mlops 2>/dev/null || echo "(cluster not reachable)"
+          echo "=== Deployments ==="
+          kubectl get deployments -n mlops 2>/dev/null || echo "(cluster not reachable)"
+          echo "=== Services ==="
+          kubectl get services -n mlops 2>/dev/null || echo "(cluster not reachable)"
+          echo "=== Events (last 20) ==="
+          kubectl get events -n mlops --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || echo "(cluster not reachable)"
+          # Always exit 0 — this is a diagnostic step, never block the workflow
+          exit 0
+
+      # ── 11. Collect pod logs on failure ───────────────────────────────────
+      - name: Collect pod logs on failure
+        if: failure()
+        run: |
+          echo "=== All pods (namespace mlops) ==="
+          kubectl get pods -n mlops -o wide || true
+          echo "=== PVC status ==="
+          kubectl get pvc -n mlops || true
+          echo "=== Postgres pod describe ==="
+          kubectl describe pod -n mlops -l app=postgres || true
+          echo "=== PostgreSQL logs ==="
+          kubectl logs -n mlops -l app=postgres --tail=100 || true
+          echo "=== API pod describe ==="
+          kubectl describe pod -n mlops -l app=api || true
+          echo "=== API logs ==="
+          kubectl logs -n mlops -l app=api --tail=100 || true
+          echo "=== Events (all) ==="
+          kubectl get events -n mlops --sort-by='.lastTimestamp' | tail -40 || true
+          echo "=== Disk usage on runner ==="
+          df -h
+
+      # ── 12. Delete Kind cluster (cleanup) ────────────────────────────────
+      - name: Delete Kind cluster
+        if: always()
+        run: kind delete cluster --name mlops-ci

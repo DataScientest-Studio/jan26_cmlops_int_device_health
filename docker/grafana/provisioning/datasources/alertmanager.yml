@@ -1,0 +1,27 @@
+# Grafana Datasource Provisioning — Alertmanager
+#
+# Provides the Alertmanager datasource so that:
+#  - alertlist panels in alerts_overview.json can display live Prometheus/Alertmanager alerts
+#  - Grafana users can query alert state without switching to Prometheus UI
+#
+# After adding this file, restart Grafana (or wait for provisioning auto-reload).
+# alertlist panels must use datasource uid: alertmanager to consume this source.
+#
+# Reference: https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources
+
+apiVersion: 1
+
+datasources:
+  - name: Alertmanager
+    type: alertmanager
+    uid: alertmanager
+    access: proxy
+    url: http://alertmanager:9093
+    isDefault: false
+    editable: true
+    jsonData:
+      # 'prometheus' implementation exposes the Alertmanager v2 API
+      implementation: prometheus
+      # handleGrafanaManagedAlerts = false: Grafana does NOT send its own alerts
+      # through Alertmanager. Prometheus is the sole alerting source.
+      handleGrafanaManagedAlerts: false

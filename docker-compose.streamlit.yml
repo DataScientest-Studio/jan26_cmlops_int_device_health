@@ -1,0 +1,60 @@
+# =============================================================================
+# docker-compose.streamlit.yml — LOCAL-BUILD STREAMLIT OVERLAY
+# =============================================================================
+# Used with:  make cloud-with-ui / make cloud-rebuild-with-ui
+# Command:    docker compose \
+#               --env-file .env.cloud --env-file .env.secrets \
+#               -f docker-compose.yml -f docker-compose.cloud.yml \
+#               -f docker-compose.streamlit.yml \
+#               up -d [--build]
+#
+# This overlay adds the Streamlit dashboard as a containerised service built
+# from the local source tree (docker/streamlit.Dockerfile).  It is the
+# locally-built counterpart to docker-compose.ghcr.yml which pulls the
+# Streamlit image from GHCR.
+#
+# Accessing the Streamlit container from a browser:
+#   http://localhost:8501   (host machine Chrome / Edge / etc.)
+#
+# The mlops_streamlit container is NOT stopped by the standard compose down
+# targets (cloud / local) because it is added by this optional overlay.
+# Use  make down  which explicitly stops mlops_streamlit first.
+# =============================================================================
+
+services:
+
+  # ── Streamlit Dashboard — locally-built container ─────────────────────────
+  streamlit:
+    build:
+      context: .
+      dockerfile: docker/streamlit.Dockerfile
+    image: mlops-streamlit-local
+    container_name: mlops_streamlit
+    environment:
+      # MLflow: use the cloud-mode buffer (same as API)
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow_buffer:5000}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-}
+      # Internal API URL (Docker network)
+      API_URL: http://api:8000
+      DEPLOYMENT_MODE: cloud
+      PYTHONUNBUFFERED: "1"
+      # Log file path inside the container
+      UI_LOG_FILE: /app/logs/ui_app.log
+    volumes:
+      # Expose the Streamlit UI log to the host
+      - ./logs:/app/logs
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - mlops_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
